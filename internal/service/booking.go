@@ -59,6 +59,9 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 	if !in.EndTime.After(in.StartTime) {
 		return model.Booking{}, ErrInvalidTimeRange
 	}
+	if !in.StartTime.After(s.now()) {
+		return model.Booking{}, ErrStartInPast
+	}
 	duration := in.EndTime.Sub(in.StartTime)
 	if duration < MinBookingDuration {
 		return model.Booking{}, ErrDurationTooShort
@@ -67,11 +70,15 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		return model.Booking{}, ErrDurationTooLong
 	}
 
-	if _, err := s.rooms.Get(ctx, in.RoomID); err != nil {
+	room, err := s.rooms.Get(ctx, in.RoomID)
+	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			return model.Booking{}, ErrRoomNotFound
 		}
 		return model.Booking{}, err
+	}
+	if room.Status == model.RoomStatusOutOfService {
+		return model.Booking{}, ErrRoomOutOfService
 	}
 
 	b := model.Booking{

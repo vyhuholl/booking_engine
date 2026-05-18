@@ -71,6 +71,7 @@ func (s *Room) Create(ctx context.Context, a Actor, in RoomCreateInput) (model.R
 		Capacity:  in.Capacity,
 		Floor:     in.Floor,
 		Equipment: dedupEquipment(in.Equipment),
+		Status:    model.RoomStatusActive,
 	}
 	if err := s.rooms.Create(ctx, r); err != nil {
 		return model.Room{}, err

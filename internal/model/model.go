@@ -33,12 +33,28 @@ const (
 	StatusCancelled BookingStatus = "cancelled"
 )
 
+type RoomStatus string
+
+const (
+	RoomStatusActive       RoomStatus = "active"
+	RoomStatusOutOfService RoomStatus = "out_of_service"
+)
+
+func (s RoomStatus) Valid() bool {
+	switch s {
+	case RoomStatusActive, RoomStatusOutOfService:
+		return true
+	}
+	return false
+}
+
 type Room struct {
 	ID        string      `json:"id"`
 	Name      string      `json:"name"`
 	Capacity  int         `json:"capacity"`
 	Floor     int         `json:"floor"`
 	Equipment []Equipment `json:"equipment"`
+	Status    RoomStatus  `json:"status"`
 }
 
 type User struct {

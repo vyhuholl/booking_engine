@@ -39,6 +39,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "INVALID_TIME_RANGE",
 			"end_time must be after start_time", nil)
 		return
+	case errors.Is(err, service.ErrStartInPast):
+		writeError(w, http.StatusBadRequest, "START_IN_PAST",
+			"start_time must be in the future", nil)
+		return
 	case errors.Is(err, service.ErrDurationTooShort):
 		writeError(w, http.StatusBadRequest, "BOOKING_DURATION_TOO_SHORT",
 			"minimum booking duration is 15 minutes", nil)
@@ -97,6 +101,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, service.ErrRoomHasActiveBookings):
 		writeError(w, http.StatusConflict, "ROOM_HAS_ACTIVE_BOOKINGS",
 			"cannot delete room with active future bookings", nil)
+		return
+	case errors.Is(err, service.ErrRoomOutOfService):
+		writeError(w, http.StatusConflict, "ROOM_OUT_OF_SERVICE",
+			"room is not available for booking", nil)
 		return
 	}
 

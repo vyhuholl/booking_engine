@@ -39,7 +39,7 @@ func (r *Room) List(ctx context.Context, f RoomFilter) ([]model.Room, int, error
 		limit = 50
 	}
 	args = append(args, limit, f.Offset)
-	query := "SELECT id, name, capacity, floor, equipment FROM rooms " + where +
+	query := "SELECT id, name, capacity, floor, equipment, status FROM rooms " + where +
 		" ORDER BY floor, name LIMIT $" + itoa(len(args)-1) + " OFFSET $" + itoa(len(args))
 
 	rows, err := r.pool.Query(ctx, query, args...)
@@ -55,8 +55,8 @@ func (r *Room) Get(ctx context.Context, id string) (model.Room, error) {
 	var room model.Room
 	var equipment []string
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, name, capacity, floor, equipment FROM rooms WHERE id = $1`, id,
-	).Scan(&room.ID, &room.Name, &room.Capacity, &room.Floor, &equipment)
+		`SELECT id, name, capacity, floor, equipment, status FROM rooms WHERE id = $1`, id,
+	).Scan(&room.ID, &room.Name, &room.Capacity, &room.Floor, &equipment, &room.Status)
 	if err != nil {
 		return model.Room{}, wrapNoRows(err)
 	}
@@ -66,16 +66,16 @@ func (r *Room) Get(ctx context.Context, id string) (model.Room, error) {
 
 func (r *Room) Create(ctx context.Context, room model.Room) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO rooms (id, name, capacity, floor, equipment) VALUES ($1, $2, $3, $4, $5)`,
-		room.ID, room.Name, room.Capacity, room.Floor, equipmentToStrings(room.Equipment),
+		`INSERT INTO rooms (id, name, capacity, floor, equipment, status) VALUES ($1, $2, $3, $4, $5, $6)`,
+		room.ID, room.Name, room.Capacity, room.Floor, equipmentToStrings(room.Equipment), room.Status,
 	)
 	return err
 }
 
 func (r *Room) Update(ctx context.Context, room model.Room) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE rooms SET name = $2, capacity = $3, floor = $4, equipment = $5 WHERE id = $1`,
-		room.ID, room.Name, room.Capacity, room.Floor, equipmentToStrings(room.Equipment),
+		`UPDATE rooms SET name = $2, capacity = $3, floor = $4, equipment = $5, status = $6 WHERE id = $1`,
+		room.ID, room.Name, room.Capacity, room.Floor, equipmentToStrings(room.Equipment), room.Status,
 	)
 	if err != nil {
 		return err
@@ -123,7 +123,7 @@ func (r *Room) Available(ctx context.Context, start, end string, capacityMin *in
 		where = append(where, "r.equipment @> $"+itoa(len(args)))
 	}
 
-	q := "SELECT id, name, capacity, floor, equipment FROM rooms r WHERE " + join(where, " AND ") + " ORDER BY r.floor, r.name"
+	q := "SELECT id, name, capacity, floor, equipment, status FROM rooms r WHERE r.status = 'active' AND " + join(where, " AND ") + " ORDER BY r.floor, r.name"
 	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -139,7 +139,7 @@ func scanRooms(rows pgx.Rows, total int) ([]model.Room, int, error) {
 	for rows.Next() {
 		var room model.Room
 		var equipment []string
-		if err := rows.Scan(&room.ID, &room.Name, &room.Capacity, &room.Floor, &equipment); err != nil {
+		if err := rows.Scan(&room.ID, &room.Name, &room.Capacity, &room.Floor, &equipment, &room.Status); err != nil {
 			return nil, 0, err
 		}
 		room.Equipment = toEquipment(equipment)
