@@ -1,0 +1,776 @@
+openapi: 3.0.3
+info:
+  title: Meeting Room Booking Service API
+  description: |
+    REST API сервиса бронирования переговорных комнат.
+
+    ## Роли
+    - **admin** — полный доступ ко всем операциям, включая CRUD комнат
+      и отмену любого бронирования.
+    - **manager** — может отменять чужие бронирования на своём этаже.
+    - **member** — может создавать и отменять только собственные бронирования.
+
+    ## Бизнес-правила
+    - Бронирование невозможно, если комната уже занята в запрошенный интервал
+      (HTTP 409).
+    - Длительность бронирования: минимум 15 минут, максимум 8 часов
+      (HTTP 400 при нарушении).
+    - Отмена возможна не позднее чем за 30 минут до начала (HTTP 409).
+    - Все временные метки в формате RFC 3339 (UTC), например
+      `2026-05-19T10:00:00Z`.
+  version: 1.0.0
+  contact:
+    name: Booking Engine Team
+    email: api@booking-engine.example.com
+
+servers:
+  - url: https://api.booking-engine.example.com/v1
+    description: Production
+  - url: https://staging.api.booking-engine.example.com/v1
+    description: Staging
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Rooms
+    description: Управление переговорными комнатами
+  - name: Bookings
+    description: Управление бронированиями
+  - name: Users
+    description: Пользовательские операции
+
+paths:
+  /rooms:
+    get:
+      tags: [Rooms]
+      summary: Список всех комнат
+      description: Возвращает список комнат. Доступно всем аутентифицированным пользователям.
+      operationId: listRooms
+      parameters:
+        - name: floor
+          in: query
+          description: Фильтр по этажу
+          required: false
+          schema:
+            type: integer
+            example: 3
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: Список комнат
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Room'
+                  total:
+                    type: integer
+                    example: 12
+              examples:
+                default:
+                  value:
+                    items:
+                      - id: "r-001"
+                        name: "Эверест"
+                        capacity: 10
+                        floor: 3
+                        equipment: [projector, whiteboard]
+                      - id: "r-002"
+                        name: "Килиманджаро"
+                        capacity: 6
+                        floor: 3
+                        equipment: [video_conf]
+                    total: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Rooms]
+      summary: Создать комнату
+      description: Только для пользователей с ролью `admin`.
+      operationId: createRoom
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomCreate'
+            examples:
+              default:
+                value:
+                  name: "Эльбрус"
+                  capacity: 8
+                  floor: 4
+                  equipment: [projector, video_conf]
+      responses:
+        '201':
+          description: Комната создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /rooms/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+
+    get:
+      tags: [Rooms]
+      summary: Получить комнату
+      operationId: getRoom
+      responses:
+        '200':
+          description: Комната
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Rooms]
+      summary: Обновить комнату
+      description: Только для `admin`.
+      operationId: updateRoom
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomUpdate'
+      responses:
+        '200':
+          description: Обновлённая комната
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Rooms]
+      summary: Удалить комнату
+      description: Только для `admin`. Удаление невозможно, если у комнаты есть будущие бронирования со статусом `confirmed`.
+      operationId: deleteRoom
+      responses:
+        '204':
+          description: Комната удалена
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: У комнаты есть активные бронирования
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: ROOM_HAS_ACTIVE_BOOKINGS
+                    message: "Невозможно удалить комнату: есть 3 будущих подтверждённых бронирования"
+
+  /rooms/available:
+    get:
+      tags: [Rooms]
+      summary: Поиск доступных комнат
+      description: |
+        Возвращает комнаты, свободные в указанном временном интервале
+        и удовлетворяющие фильтрам.
+      operationId: searchAvailableRooms
+      parameters:
+        - name: start
+          in: query
+          required: true
+          description: Начало интервала (RFC 3339, UTC)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-05-19T10:00:00Z"
+        - name: end
+          in: query
+          required: true
+          description: Конец интервала (RFC 3339, UTC)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-05-19T11:00:00Z"
+        - name: capacity_min
+          in: query
+          required: false
+          description: Минимальная вместимость
+          schema:
+            type: integer
+            minimum: 1
+            example: 4
+        - name: floor
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: equipment
+          in: query
+          required: false
+          description: Необходимое оборудование (массив, повторяемый параметр)
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/Equipment'
+          style: form
+          explode: true
+      responses:
+        '200':
+          description: Список доступных комнат
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Room'
+              examples:
+                default:
+                  value:
+                    - id: "r-001"
+                      name: "Эверест"
+                      capacity: 10
+                      floor: 3
+                      equipment: [projector, whiteboard]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rooms/{id}/bookings:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [Rooms]
+      summary: Бронирования конкретной комнаты
+      description: Список бронирований комнаты за указанную дату (UTC).
+      operationId: listRoomBookings
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Дата в формате YYYY-MM-DD (UTC)
+          schema:
+            type: string
+            format: date
+            example: "2026-05-19"
+      responses:
+        '200':
+          description: Бронирования комнаты на указанную дату
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Booking'
+              examples:
+                default:
+                  value:
+                    - id: "b-100"
+                      room_id: "r-001"
+                      user_id: "u-42"
+                      title: "Sprint Planning"
+                      start_time: "2026-05-19T10:00:00Z"
+                      end_time: "2026-05-19T11:00:00Z"
+                      status: confirmed
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings:
+    post:
+      tags: [Bookings]
+      summary: Создать бронирование
+      description: |
+        Создаёт бронирование комнаты. Сервер проверяет:
+        - Существование комнаты.
+        - Длительность от 15 минут до 8 часов.
+        - Отсутствие пересечений с другими `confirmed` бронированиями.
+      operationId: createBooking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingCreate'
+            examples:
+              default:
+                value:
+                  room_id: "r-001"
+                  title: "Sprint Planning"
+                  start_time: "2026-05-19T10:00:00Z"
+                  end_time: "2026-05-19T11:00:00Z"
+      responses:
+        '201':
+          description: Бронирование создано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Невалидные данные (неправильный интервал, нарушение лимитов)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                durationTooShort:
+                  summary: Слишком короткое бронирование
+                  value:
+                    code: BOOKING_DURATION_TOO_SHORT
+                    message: "Минимальная длительность бронирования — 15 минут"
+                durationTooLong:
+                  summary: Слишком длинное бронирование
+                  value:
+                    code: BOOKING_DURATION_TOO_LONG
+                    message: "Максимальная длительность бронирования — 8 часов"
+                invalidRange:
+                  summary: Некорректный временной интервал
+                  value:
+                    code: INVALID_TIME_RANGE
+                    message: "end_time должен быть позже start_time"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Комната не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: ROOM_NOT_FOUND
+                    message: "Комната с id 'r-999' не найдена"
+        '409':
+          description: Конфликт — комната уже занята в этом интервале
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: BOOKING_CONFLICT
+                    message: "Комната уже забронирована в указанный интервал"
+                    details:
+                      conflicting_booking_id: "b-87"
+                      conflicting_start: "2026-05-19T10:30:00Z"
+                      conflicting_end: "2026-05-19T11:30:00Z"
+
+  /bookings/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    post:
+      tags: [Bookings]
+      summary: Отменить бронирование
+      description: |
+        Правила доступа:
+        - Автор бронирования может отменить только своё бронирование.
+        - `manager` может отменять чужие бронирования **на своём этаже**.
+        - `admin` может отменять любое бронирование.
+
+        Отмена возможна не позднее чем за 30 минут до `start_time`.
+      operationId: cancelBooking
+      responses:
+        '200':
+          description: Бронирование отменено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+              examples:
+                default:
+                  value:
+                    id: "b-100"
+                    room_id: "r-001"
+                    user_id: "u-42"
+                    title: "Sprint Planning"
+                    start_time: "2026-05-19T10:00:00Z"
+                    end_time: "2026-05-19T11:00:00Z"
+                    status: cancelled
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Недостаточно прав для отмены этого бронирования
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: CANCEL_FORBIDDEN
+                    message: "Manager может отменять чужие бронирования только на своём этаже"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Конфликт состояния — нельзя отменить
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                tooLate:
+                  summary: Поздно отменять
+                  value:
+                    code: CANCEL_TOO_LATE
+                    message: "Отмена невозможна позднее чем за 30 минут до начала"
+                alreadyCancelled:
+                  summary: Уже отменено
+                  value:
+                    code: BOOKING_ALREADY_CANCELLED
+                    message: "Бронирование уже отменено"
+
+  /users/{id}/bookings:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      summary: Бронирования пользователя
+      description: |
+        Возвращает бронирования указанного пользователя.
+        - `member` может смотреть только свои.
+        - `manager`/`admin` могут смотреть чужие.
+      operationId: listUserBookings
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+        - name: from
+          in: query
+          required: false
+          description: Фильтр — бронирования начиная с этой даты (UTC)
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Список бронирований пользователя
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Booking'
+              examples:
+                default:
+                  value:
+                    - id: "b-100"
+                      room_id: "r-001"
+                      user_id: "u-42"
+                      title: "Sprint Planning"
+                      start_time: "2026-05-19T10:00:00Z"
+                      end_time: "2026-05-19T11:00:00Z"
+                      status: confirmed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    RoomId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор комнаты
+      schema:
+        type: string
+        example: "r-001"
+    BookingId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор бронирования
+      schema:
+        type: string
+        example: "b-100"
+    UserId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор пользователя
+      schema:
+        type: string
+        example: "u-42"
+
+  schemas:
+    Equipment:
+      type: string
+      description: Оборудование в комнате
+      enum:
+        - projector
+        - whiteboard
+        - video_conf
+      example: projector
+
+    Role:
+      type: string
+      description: Роль пользователя
+      enum:
+        - admin
+        - manager
+        - member
+      example: member
+
+    BookingStatus:
+      type: string
+      enum:
+        - confirmed
+        - cancelled
+      example: confirmed
+
+    Room:
+      type: object
+      required: [id, name, capacity, floor, equipment]
+      properties:
+        id:
+          type: string
+          example: "r-001"
+        name:
+          type: string
+          example: "Эверест"
+        capacity:
+          type: integer
+          minimum: 1
+          example: 10
+        floor:
+          type: integer
+          example: 3
+        equipment:
+          type: array
+          items:
+            $ref: '#/components/schemas/Equipment'
+          example: [projector, whiteboard]
+
+    RoomCreate:
+      type: object
+      required: [name, capacity, floor]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "Эльбрус"
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          example: 8
+        floor:
+          type: integer
+          example: 4
+        equipment:
+          type: array
+          items:
+            $ref: '#/components/schemas/Equipment'
+          default: []
+          example: [projector, video_conf]
+
+    RoomUpdate:
+      type: object
+      description: Поля для обновления комнаты. Все поля опциональны.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        floor:
+          type: integer
+        equipment:
+          type: array
+          items:
+            $ref: '#/components/schemas/Equipment'
+
+    User:
+      type: object
+      required: [id, name, email, role]
+      properties:
+        id:
+          type: string
+          example: "u-42"
+        name:
+          type: string
+          example: "Иван Петров"
+        email:
+          type: string
+          format: email
+          example: "ivan.petrov@example.com"
+        role:
+          $ref: '#/components/schemas/Role'
+
+    Booking:
+      type: object
+      required: [id, room_id, user_id, title, start_time, end_time, status]
+      properties:
+        id:
+          type: string
+          example: "b-100"
+        room_id:
+          type: string
+          example: "r-001"
+        user_id:
+          type: string
+          example: "u-42"
+        title:
+          type: string
+          example: "Sprint Planning"
+        start_time:
+          type: string
+          format: date-time
+          example: "2026-05-19T10:00:00Z"
+        end_time:
+          type: string
+          format: date-time
+          example: "2026-05-19T11:00:00Z"
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+
+    BookingCreate:
+      type: object
+      required: [room_id, title, start_time, end_time]
+      properties:
+        room_id:
+          type: string
+          example: "r-001"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          example: "Sprint Planning"
+        start_time:
+          type: string
+          format: date-time
+          description: Начало бронирования (RFC 3339, UTC)
+          example: "2026-05-19T10:00:00Z"
+        end_time:
+          type: string
+          format: date-time
+          description: Конец бронирования (RFC 3339, UTC). Длительность от 15 минут до 8 часов.
+          example: "2026-05-19T11:00:00Z"
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Машиночитаемый код ошибки
+          example: BOOKING_CONFLICT
+        message:
+          type: string
+          description: Человекочитаемое сообщение
+          example: "Комната уже забронирована в указанный интервал"
+        details:
+          type: object
+          description: Дополнительные данные об ошибке (произвольная структура)
+          additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Невалидные параметры запроса
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            default:
+              value:
+                code: VALIDATION_ERROR
+                message: "Параметр 'capacity_min' должен быть положительным числом"
+    Unauthorized:
+      description: Не авторизован
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            default:
+              value:
+                code: UNAUTHORIZED
+                message: "Требуется аутентификация"
+    Forbidden:
+      description: Нет прав на выполнение операции
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            default:
+              value:
+                code: FORBIDDEN
+                message: "Операция доступна только пользователю с ролью admin"
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            default:
+              value:
+                code: NOT_FOUND
+                message: "Запрашиваемый ресурс не найден"

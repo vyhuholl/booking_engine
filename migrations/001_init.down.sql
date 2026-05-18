@@ -1,0 +1,9 @@
+BEGIN;
+
+DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS rooms;
+DROP TYPE  IF EXISTS booking_status;
+DROP TYPE  IF EXISTS user_role;
+
+COMMIT;
