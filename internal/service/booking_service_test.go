@@ -25,6 +25,7 @@ type mockBookingRepo struct {
 	cancelFn        func(ctx context.Context, id string) error
 	listByUserFn    func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
 	listByRoomFn    func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+	getByRangeFn    func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
 func (m *mockBookingRepo) Get(ctx context.Context, id string) (model.Booking, error) {
@@ -60,6 +61,13 @@ func (m *mockBookingRepo) ListByRoomInPeriod(ctx context.Context, roomID string,
 		panic("mockBookingRepo.ListByRoomInPeriod: not set up")
 	}
 	return m.listByRoomFn(ctx, roomID, from, to)
+}
+
+func (m *mockBookingRepo) GetBookingsByDateRange(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error) {
+	if m.getByRangeFn == nil {
+		panic("mockBookingRepo.GetBookingsByDateRange: not set up")
+	}
+	return m.getByRangeFn(ctx, roomID, from, to)
 }
 
 type mockRoomLookup struct {

@@ -150,6 +150,14 @@ func (r *Booking) ListByRoomInPeriod(ctx context.Context, roomID string, from, t
 	return scanBookings(rows)
 }
 
+// GetBookingsByDateRange возвращает бронирования комнаты со start_time в
+// полуоткрытом интервале [from, to). Выборка идентична ListByRoomInPeriod (брони
+// в любом статусе, сортировка по времени начала; фильтрация по статусу/пользователю
+// выполняется в сервисе) — это её доменно именованный псевдоним для недельного отчёта.
+func (r *Booking) GetBookingsByDateRange(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error) {
+	return r.ListByRoomInPeriod(ctx, roomID, from, to)
+}
+
 // CountByRoomInPeriod возвращает число бронирований комнаты, чей start_time
 // попадает в полуоткрытый интервал [from, to). Учитываются брони в любом
 // статусе (как и ListByRoomOnDate — это картина использования комнаты, а не

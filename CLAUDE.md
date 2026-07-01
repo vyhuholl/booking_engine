@@ -60,6 +60,31 @@ handler — `UserLookup`), а не в реализующем пакете — э
   подтесте для изоляции). Данные сеются хелперами `seedRoom`/`seedUser`. **Нужен Docker.**
   Сборочных тегов нет; фильтруй пакетом: `go test ./internal/repository/...`.
 
+## Хелперы тестов (internal/testutil)
+
+Не собирай фикстуры вручную — используй хелперы. Дефолты детерминированы
+(константы `RoomID`/`UserID`/`OtherUserID`/`AdminID`/`BookingID`, якоря времени
+`FixedNow`, `BaseStart`, `BaseEnd`, зона `MSK`), поэтому сравнения на равенство
+предсказуемы.
+
+- **Фикстуры (функциональные опции)** — возвращают `model.*`, применяют опции по порядку:
+  - `Room(opts...)` — опции `WithRoomID`, `WithFloor`, `WithCapacity`, `WithRoomStatus`, `WithEquipment`.
+  - `User(opts...)` — опции `WithUserID`, `WithRole`, `WithManagesFloor`, `WithEmail`.
+  - `Booking(opts...)` — опции `WithBookingID`, `WithRoom`, `WithOwner`, `WithStart`,
+    `WithInterval`, `WithDuration`, `WithBookingStatus`, `WithTitle`.
+- **Билдер брони (цепочечный)** — `NewBookingBuilder(t)` с
+  `WithRoom(model.Room)` / `WithUser(model.User)` / `WithTime(start, end)` /
+  `WithStatus(string)` и терминальным `Build() model.Booking`. Сам подставляет
+  дефолтные комнату и пользователя (member), если не заданы, и выдаёт брони свежий uuid.
+- **Часы** — `Clock(now)` возвращает `func() time.Time` для подмены поля `now` сервиса.
+- **Ассерты ошибок** — `AssertServiceError(t, err, wantIs, wantAs)`,
+  `AssertSentinel(t, err, want)`, `AssertTyped[E](t, err) E`.
+- **Интеграционные (нужен Docker)** — `SetupTestDB(t)` (пул + cleanup),
+  сиды `SeedRoom`/`SeedUser`/`SeedBooking` (принимают те же опции фикстур),
+  `FreshRoomAndUser(t, pool, cleanup)` — типовой пролог подтеста.
+
+Builder — когда нужен конкретный набор полей. Object mother — когда нужен «просто объект». Не создавать model.Booking{...} руками в тестах.
+
 ## Правила
 
 - **Новый код обязан иметь тесты.** Бизнес-правила → unit-тест в service; новый SQL → интеграционный
@@ -93,31 +118,6 @@ handler — `UserLookup`), а не в реализующем пакете — э
 - docker-compose.yml
 - migrations/ (используй схему из комментария в модели)
 - web/ (фронтенд, не относится к API)
-
-## Хелперы тестов (internal/testutil)
-
-Не собирай фикстуры вручную — используй хелперы. Дефолты детерминированы
-(константы `RoomID`/`UserID`/`OtherUserID`/`AdminID`/`BookingID`, якоря времени
-`FixedNow`, `BaseStart`, `BaseEnd`, зона `MSK`), поэтому сравнения на равенство
-предсказуемы.
-
-- **Фикстуры (функциональные опции)** — возвращают `model.*`, применяют опции по порядку:
-  - `Room(opts...)` — опции `WithRoomID`, `WithFloor`, `WithCapacity`, `WithRoomStatus`, `WithEquipment`.
-  - `User(opts...)` — опции `WithUserID`, `WithRole`, `WithManagesFloor`, `WithEmail`.
-  - `Booking(opts...)` — опции `WithBookingID`, `WithRoom`, `WithOwner`, `WithStart`,
-    `WithInterval`, `WithDuration`, `WithBookingStatus`, `WithTitle`.
-- **Билдер брони (цепочечный)** — `NewBookingBuilder(t)` с
-  `WithRoom(model.Room)` / `WithUser(model.User)` / `WithTime(start, end)` /
-  `WithStatus(string)` и терминальным `Build() model.Booking`. Сам подставляет
-  дефолтные комнату и пользователя (member), если не заданы, и выдаёт брони свежий uuid.
-- **Часы** — `Clock(now)` возвращает `func() time.Time` для подмены поля `now` сервиса.
-- **Ассерты ошибок** — `AssertServiceError(t, err, wantIs, wantAs)`,
-  `AssertSentinel(t, err, want)`, `AssertTyped[E](t, err) E`.
-- **Интеграционные (нужен Docker)** — `SetupTestDB(t)` (пул + cleanup),
-  сиды `SeedRoom`/`SeedUser`/`SeedBooking` (принимают те же опции фикстур),
-  `FreshRoomAndUser(t, pool, cleanup)` — типовой пролог подтеста.
-
-Builder — когда нужен конкретный набор полей. Object mother — когда нужен «просто объект». Не создавать model.Booking{...} руками в тестах.
 
 ## Observability
 

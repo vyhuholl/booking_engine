@@ -31,6 +31,7 @@ type BookingRepo interface {
 	Cancel(ctx context.Context, id string) error
 	ListByUser(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
 	ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+	GetBookingsByDateRange(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
 // RoomLookup — доступ к комнатам, нужный сервису бронирования: точечный Get
@@ -326,6 +327,68 @@ type WeeklyReport struct {
 	Days      []DayBookings
 }
 
+// weekBounds нормализует weekStart к началу суток в UTC и возвращает полуоткрытый
+// интервал недели [dayStart, weekEnd).
+func weekBounds(weekStart time.Time) (dayStart, weekEnd time.Time) {
+	w := weekStart.UTC()
+	dayStart = time.Date(w.Year(), w.Month(), w.Day(), 0, 0, 0, 0, time.UTC)
+	return dayStart, dayStart.AddDate(0, 0, DaysPerWeek)
+}
+
+// dayIndex возвращает порядковый номер дня start_time относительно начала недели
+// dayStart (0 = первый день). В UTC сутки ровно 24 часа, поэтому индекс однозначен.
+func dayIndex(start, dayStart time.Time) int {
+	return int(start.UTC().Sub(dayStart) / (24 * time.Hour))
+}
+
+// matchesBookingFilters сообщает, проходит ли бронь необязательные фильтры:
+// nil-поле фильтра пропускает бронь с любым значением этого измерения.
+func matchesBookingFilters(b model.Booking, f model.BookingFilters) bool {
+	if f.Status != nil && string(b.Status) != *f.Status {
+		return false
+	}
+	if f.UserID != nil && b.UserID != *f.UserID {
+		return false
+	}
+	return true
+}
+
+// GetBookingsByWeek возвращает брони комнаты за неделю [weekStart, weekStart+7д),
+// сгруппированные по дням start_time и отфильтрованные по filters. weekStart обязан
+// быть понедельником — иначе ValidationError. Результат всегда содержит ровно
+// DaysPerWeek элементов, по одному на день начиная с weekStart; несуществующая
+// комната (нет броней в периоде) даёт неделю пустых дней без ошибки.
+func (s *Booking) GetBookingsByWeek(ctx context.Context, roomID string, weekStart time.Time, filters model.BookingFilters) ([]model.DailyBookings, error) {
+	if weekStart.UTC().Weekday() != time.Monday {
+		return nil, &ValidationError{Field: "week_start", Message: "week_start must be a Monday"}
+	}
+	dayStart, weekEnd := weekBounds(weekStart)
+
+	bookings, err := s.bookings.GetBookingsByDateRange(ctx, roomID, dayStart, weekEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	days := make([]model.DailyBookings, DaysPerWeek)
+	for i := range days {
+		days[i] = model.DailyBookings{
+			Date:     dayStart.AddDate(0, 0, i),
+			Bookings: []model.Booking{},
+		}
+	}
+	for _, b := range bookings {
+		if !matchesBookingFilters(b, filters) {
+			continue
+		}
+		idx := dayIndex(b.StartTime, dayStart)
+		if idx < 0 || idx >= DaysPerWeek {
+			continue // страховка: репозиторий такие записи не возвращает
+		}
+		days[idx].Bookings = append(days[idx].Bookings, b)
+	}
+	return days, nil
+}
+
 // GetWeeklyReport возвращает бронирования комнаты за неделю, начинающуюся с weekStart,
 // сгруппированные по дням. weekStart нормализуется к началу суток в UTC. Как и остальные
 // отчёты об использовании комнаты, учитываются брони в любом статусе; группировка идёт
@@ -346,9 +409,7 @@ func (s *Booking) GetWeeklyReport(ctx context.Context, _ Actor, roomID string, w
 		return WeeklyReport{}, err
 	}
 
-	weekStart = weekStart.UTC()
-	dayStart := time.Date(weekStart.Year(), weekStart.Month(), weekStart.Day(), 0, 0, 0, 0, time.UTC)
-	weekEnd := dayStart.AddDate(0, 0, DaysPerWeek)
+	dayStart, weekEnd := weekBounds(weekStart)
 
 	bookings, err := s.bookings.ListByRoomInPeriod(ctx, roomID, dayStart, weekEnd)
 	if err != nil {
@@ -362,10 +423,8 @@ func (s *Booking) GetWeeklyReport(ctx context.Context, _ Actor, roomID string, w
 			Bookings: []model.Booking{},
 		}
 	}
-	// В UTC нет переходов на летнее время, поэтому сутки ровно 24 часа и индекс дня
-	// однозначно определяется смещением start_time от начала недели.
 	for _, b := range bookings {
-		idx := int(b.StartTime.UTC().Sub(dayStart) / (24 * time.Hour))
+		idx := dayIndex(b.StartTime, dayStart)
 		if idx < 0 || idx >= DaysPerWeek {
 			continue // страховка: репозиторий такие записи не возвращает
 		}

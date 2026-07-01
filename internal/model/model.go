@@ -74,3 +74,16 @@ type Booking struct {
 	EndTime   time.Time     `json:"end_time"`
 	Status    BookingStatus `json:"status"`
 }
+
+// BookingFilters — необязательные фильтры выборки броней. nil-поле означает
+// «без фильтра по этому измерению» (учитываются все значения).
+type BookingFilters struct {
+	Status *string `json:"status,omitempty"`  // фильтр по статусу брони, nil = любой
+	UserID *string `json:"user_id,omitempty"` // фильтр по владельцу, nil = любой
+}
+
+// DailyBookings — брони одного дня, сгруппированные для недельной выборки.
+type DailyBookings struct {
+	Date     time.Time `json:"date"`     // начало суток в UTC
+	Bookings []Booking `json:"bookings"` // брони этого дня (пустой список, не nil)
+}
