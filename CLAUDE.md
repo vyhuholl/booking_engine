@@ -94,11 +94,25 @@ handler — `UserLookup`), а не в реализующем пакете — э
 - migrations/ (используй схему из комментария в модели)
 - web/ (фронтенд, не относится к API)
 
-## Тесты
+## Хелперы тестов (internal/testutil)
 
-При написании тестов использовать хелперы из internal/testutil:
-- Фикстуры: testutil.NewTestRoom(t), testutil.NewTestUser(t, role), testutil.NewTestBooking(t, room, user, start, end)
-- Ассерты: testutil.AssertBookingEqual(t, expected, actual), testutil.AssertTimeInRange(t, got, start, end)
-- Setup: testutil.SetupRoomWithUser(t), testutil.TimeSlot(offset, duration)
+Не собирай фикстуры вручную — используй хелперы. Дефолты детерминированы
+(константы `RoomID`/`UserID`/`OtherUserID`/`AdminID`/`BookingID`, якоря времени
+`FixedNow`, `BaseStart`, `BaseEnd`, зона `MSK`), поэтому сравнения на равенство
+предсказуемы.
 
-Не создавать фикстуры вручную в тестах — использовать testutil.
+- **Фикстуры (функциональные опции)** — возвращают `model.*`, применяют опции по порядку:
+  - `Room(opts...)` — опции `WithRoomID`, `WithFloor`, `WithCapacity`, `WithRoomStatus`, `WithEquipment`.
+  - `User(opts...)` — опции `WithUserID`, `WithRole`, `WithManagesFloor`, `WithEmail`.
+  - `Booking(opts...)` — опции `WithBookingID`, `WithRoom`, `WithOwner`, `WithStart`,
+    `WithInterval`, `WithDuration`, `WithBookingStatus`, `WithTitle`.
+- **Билдер брони (цепочечный)** — `NewBookingBuilder(t)` с
+  `WithRoom(model.Room)` / `WithUser(model.User)` / `WithTime(start, end)` /
+  `WithStatus(string)` и терминальным `Build() model.Booking`. Сам подставляет
+  дефолтные комнату и пользователя (member), если не заданы, и выдаёт брони свежий uuid.
+- **Часы** — `Clock(now)` возвращает `func() time.Time` для подмены поля `now` сервиса.
+- **Ассерты ошибок** — `AssertServiceError(t, err, wantIs, wantAs)`,
+  `AssertSentinel(t, err, want)`, `AssertTyped[E](t, err) E`.
+- **Интеграционные (нужен Docker)** — `SetupTestDB(t)` (пул + cleanup),
+  сиды `SeedRoom`/`SeedUser`/`SeedBooking` (принимают те же опции фикстур),
+  `FreshRoomAndUser(t, pool, cleanup)` — типовой пролог подтеста.
