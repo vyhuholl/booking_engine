@@ -70,6 +70,7 @@ func (m *mockRoomRepo) Available(ctx context.Context, start, end string, capacit
 type mockBookingsForRoom struct {
 	hasActiveFn        func(ctx context.Context, roomID string, after time.Time) (bool, error)
 	listByRoomOnDateFn func(ctx context.Context, roomID string, date time.Time) ([]model.Booking, error)
+	countInPeriodFn    func(ctx context.Context, roomID string, from, to time.Time) (int, error)
 }
 
 func (m *mockBookingsForRoom) HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error) {
@@ -84,6 +85,13 @@ func (m *mockBookingsForRoom) ListByRoomOnDate(ctx context.Context, roomID strin
 		panic("mockBookingsForRoom.ListByRoomOnDate: not set up")
 	}
 	return m.listByRoomOnDateFn(ctx, roomID, date)
+}
+
+func (m *mockBookingsForRoom) CountByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) (int, error) {
+	if m.countInPeriodFn == nil {
+		panic("mockBookingsForRoom.CountByRoomInPeriod: not set up")
+	}
+	return m.countInPeriodFn(ctx, roomID, from, to)
 }
 
 func newTestRoomService(rooms *mockRoomRepo, bookings *mockBookingsForRoom) *Room {
@@ -605,5 +613,53 @@ func TestRoomService_Reads(t *testing.T) {
 		svc := newTestRoomService(rooms, &mockBookingsForRoom{})
 		_, err := svc.BookingsOnDate(context.Background(), Actor{}, "ghost", fixedNow)
 		assert.ErrorIs(t, err, ErrRoomNotFound)
+	})
+}
+
+// --- Stats ---------------------------------------------------------------
+
+func TestRoomService_Stats(t *testing.T) {
+	t.Run("TC-085 Stats returns count for the last month with the computed window", func(t *testing.T) {
+		var gotFrom, gotTo time.Time
+		rooms := &mockRoomRepo{
+			getFn: func(_ context.Context, _ string) (model.Room, error) { return testRoom(2), nil },
+		}
+		bookings := &mockBookingsForRoom{
+			countInPeriodFn: func(_ context.Context, _ string, from, to time.Time) (int, error) {
+				gotFrom, gotTo = from, to
+				return 7, nil
+			},
+		}
+		svc := newTestRoomService(rooms, bookings)
+
+		got, err := svc.Stats(context.Background(), testActor(model.RoleMember), testRoomID)
+		assert.NoError(t, err)
+		assert.Equal(t, testRoomID, got.RoomID)
+		assert.Equal(t, 7, got.BookingCount)
+		assert.True(t, got.PeriodEnd.Equal(fixedNow), "период заканчивается в now")
+		assert.True(t, got.PeriodStart.Equal(fixedNow.AddDate(0, -1, 0)), "период начинается за месяц до now")
+		assert.True(t, gotFrom.Equal(fixedNow.AddDate(0, -1, 0)), "в репозиторий передан from = now-1мес")
+		assert.True(t, gotTo.Equal(fixedNow), "в репозиторий передан to = now")
+	})
+
+	t.Run("TC-086 Stats returns ErrRoomNotFound for a missing room", func(t *testing.T) {
+		rooms := &mockRoomRepo{
+			getFn: func(_ context.Context, _ string) (model.Room, error) { return model.Room{}, repository.ErrNotFound },
+		}
+		svc := newTestRoomService(rooms, &mockBookingsForRoom{})
+		_, err := svc.Stats(context.Background(), testActor(model.RoleMember), "ghost")
+		assert.ErrorIs(t, err, ErrRoomNotFound)
+	})
+
+	t.Run("TC-087 Stats propagates an unexpected repository error", func(t *testing.T) {
+		rooms := &mockRoomRepo{
+			getFn: func(_ context.Context, _ string) (model.Room, error) { return testRoom(2), nil },
+		}
+		bookings := &mockBookingsForRoom{
+			countInPeriodFn: func(_ context.Context, _ string, _, _ time.Time) (int, error) { return 0, errAny },
+		}
+		svc := newTestRoomService(rooms, bookings)
+		_, err := svc.Stats(context.Background(), testActor(model.RoleMember), testRoomID)
+		assert.ErrorIs(t, err, errAny)
 	})
 }

@@ -32,6 +32,13 @@ type roomListResponse struct {
 	Total int          `json:"total"`
 }
 
+type roomStatsResponse struct {
+	RoomID       string    `json:"room_id"`
+	PeriodStart  time.Time `json:"period_start"`
+	PeriodEnd    time.Time `json:"period_end"`
+	BookingCount int       `json:"booking_count"`
+}
+
 func (h *Handler) listRooms(w http.ResponseWriter, r *http.Request) {
 	f := repository.RoomFilter{
 		Limit:  parseInt(r.URL.Query().Get("limit"), 50),
@@ -167,6 +174,20 @@ func (h *Handler) listRoomBookings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, bookings)
+}
+
+func (h *Handler) getRoomStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.rooms.Stats(r.Context(), actorFromCtx(r.Context()), chi.URLParam(r, "id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roomStatsResponse{
+		RoomID:       stats.RoomID,
+		PeriodStart:  stats.PeriodStart,
+		PeriodEnd:    stats.PeriodEnd,
+		BookingCount: stats.BookingCount,
+	})
 }
 
 func parseInt(v string, def int) int {

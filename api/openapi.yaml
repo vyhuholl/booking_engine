@@ -319,6 +319,33 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /rooms/{id}/stats:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    get:
+      tags: [Rooms]
+      summary: Статистика бронирований комнаты
+      description: Количество бронирований комнаты за последний месяц (окно `[period_start, period_end)`, любой статус).
+      operationId: getRoomStats
+      responses:
+        '200':
+          description: Статистика комнаты за последний месяц
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomStats'
+              examples:
+                default:
+                  value:
+                    room_id: "r-001"
+                    period_start: "2026-04-19T08:00:00Z"
+                    period_end: "2026-05-19T08:00:00Z"
+                    booking_count: 12
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /bookings:
     post:
       tags: [Bookings]
@@ -601,6 +628,29 @@ components:
           items:
             $ref: '#/components/schemas/Equipment'
           example: [projector, whiteboard]
+
+    RoomStats:
+      type: object
+      required: [room_id, period_start, period_end, booking_count]
+      properties:
+        room_id:
+          type: string
+          example: "r-001"
+        period_start:
+          type: string
+          format: date-time
+          description: Начало окна статистики (now − 1 месяц, UTC)
+          example: "2026-04-19T08:00:00Z"
+        period_end:
+          type: string
+          format: date-time
+          description: Конец окна статистики (now, UTC)
+          example: "2026-05-19T08:00:00Z"
+        booking_count:
+          type: integer
+          minimum: 0
+          description: Число бронирований, начавшихся в окне
+          example: 12
 
     RoomCreate:
       type: object

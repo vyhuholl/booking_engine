@@ -200,6 +200,68 @@ func TestBooking_CreateChecked(t *testing.T) {
 	})
 }
 
+func TestBooking_CountByRoomInPeriod(t *testing.T) {
+	pool, cleanup := testutil.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	repo := repository.NewBooking(pool)
+	ctx := context.Background()
+	// now имитируем как фиксированный момент; окно "последнего месяца" — [from, to).
+	to := time.Date(2030, 6, 1, 12, 0, 0, 0, time.UTC)
+	from := to.AddDate(0, -1, 0) // 2030-05-01 12:00
+
+	t.Run("counts only bookings whose start_time falls inside [from, to)", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		otherRoom := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		// В окне: две брони.
+		inWindowA := newBooking(roomID, userID, from.Add(24*time.Hour), time.Hour)
+		inWindowB := newBooking(roomID, userID, to.Add(-24*time.Hour), time.Hour)
+		// Вне окна: раньше from и позже/на границе to.
+		beforeWindow := newBooking(roomID, userID, from.Add(-time.Hour), time.Hour)
+		atUpperBound := newBooking(roomID, userID, to, time.Hour) // to исключается (полуоткрытый интервал)
+		// Другая комната — не считается.
+		otherRoomBooking := newBooking(otherRoom, userID, from.Add(48*time.Hour), time.Hour)
+
+		for _, b := range []model.Booking{inWindowA, inWindowB, beforeWindow, atUpperBound, otherRoomBooking} {
+			_, err := repo.CreateChecked(ctx, b)
+			require.NoError(t, err)
+		}
+
+		n, err := repo.CountByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+	})
+
+	t.Run("cancelled bookings are also counted", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		confirmed := newBooking(roomID, userID, from.Add(24*time.Hour), time.Hour)
+		cancelled := newBooking(roomID, userID, from.Add(48*time.Hour), time.Hour)
+		_, err := repo.CreateChecked(ctx, confirmed)
+		require.NoError(t, err)
+		_, err = repo.CreateChecked(ctx, cancelled)
+		require.NoError(t, err)
+		require.NoError(t, repo.Cancel(ctx, cancelled.ID))
+
+		n, err := repo.CountByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+	})
+
+	t.Run("room without bookings in the period returns zero", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+
+		n, err := repo.CountByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n)
+	})
+}
+
 func TestBooking_Cancel(t *testing.T) {
 	pool, cleanup := testutil.SetupTestDB(t)
 	t.Cleanup(cleanup)

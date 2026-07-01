@@ -129,6 +129,22 @@ func (r *Booking) ListByRoomOnDate(ctx context.Context, roomID string, date time
 	return scanBookings(rows)
 }
 
+// CountByRoomInPeriod возвращает число бронирований комнаты, чей start_time
+// попадает в полуоткрытый интервал [from, to). Учитываются брони в любом
+// статусе (как и ListByRoomOnDate — это картина использования комнаты, а не
+// только подтверждённых броней).
+func (r *Booking) CountByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx, `
+        SELECT COUNT(*) FROM bookings
+         WHERE room_id    = $1
+           AND start_time >= $2
+           AND start_time <  $3`,
+		roomID, from, to,
+	).Scan(&n)
+	return n, err
+}
+
 func (r *Booking) HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error) {
 	var exists bool
 	err := r.pool.QueryRow(ctx, `

@@ -24,6 +24,7 @@ type RoomRepo interface {
 type BookingsForRoom interface {
 	HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error)
 	ListByRoomOnDate(ctx context.Context, roomID string, date time.Time) ([]model.Booking, error)
+	CountByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) (int, error)
 }
 
 type Room struct {
@@ -160,6 +161,34 @@ func (s *Room) BookingsOnDate(ctx context.Context, _ Actor, roomID string, date 
 		return nil, err
 	}
 	return s.bookings.ListByRoomOnDate(ctx, roomID, date)
+}
+
+// RoomStats — статистика использования комнаты за период [PeriodStart, PeriodEnd).
+type RoomStats struct {
+	RoomID       string
+	PeriodStart  time.Time
+	PeriodEnd    time.Time
+	BookingCount int
+}
+
+// Stats возвращает число бронирований комнаты за последний месяц
+// (с момента now минус один календарный месяц по текущий момент).
+func (s *Room) Stats(ctx context.Context, _ Actor, roomID string) (RoomStats, error) {
+	if _, err := s.getOr404(ctx, roomID); err != nil {
+		return RoomStats{}, err
+	}
+	to := s.now().UTC()
+	from := to.AddDate(0, -1, 0)
+	count, err := s.bookings.CountByRoomInPeriod(ctx, roomID, from, to)
+	if err != nil {
+		return RoomStats{}, err
+	}
+	return RoomStats{
+		RoomID:       roomID,
+		PeriodStart:  from,
+		PeriodEnd:    to,
+		BookingCount: count,
+	}, nil
 }
 
 func (s *Room) getOr404(ctx context.Context, id string) (model.Room, error) {

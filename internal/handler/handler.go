@@ -68,6 +68,7 @@ func (h *Handler) Router() http.Handler {
 			r.Put("/{id}", h.updateRoom)
 			r.Delete("/{id}", h.deleteRoom)
 			r.Get("/{id}/bookings", h.listRoomBookings)
+			r.Get("/{id}/stats", h.getRoomStats)
 		})
 
 		r.Route("/bookings", func(r chi.Router) {
