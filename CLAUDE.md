@@ -93,3 +93,12 @@ handler — `UserLookup`), а не в реализующем пакете — э
 - docker-compose.yml
 - migrations/ (используй схему из комментария в модели)
 - web/ (фронтенд, не относится к API)
+
+## Тесты
+
+При написании тестов использовать хелперы из internal/testutil:
+- Фикстуры: testutil.NewTestRoom(t), testutil.NewTestUser(t, role), testutil.NewTestBooking(t, room, user, start, end)
+- Ассерты: testutil.AssertBookingEqual(t, expected, actual), testutil.AssertTimeInRange(t, got, start, end)
+- Setup: testutil.SetupRoomWithUser(t), testutil.TimeSlot(offset, duration)
+
+Не создавать фикстуры вручную в тестах — использовать testutil.
