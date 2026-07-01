@@ -116,3 +116,5 @@ handler — `UserLookup`), а не в реализующем пакете — э
 - **Интеграционные (нужен Docker)** — `SetupTestDB(t)` (пул + cleanup),
   сиды `SeedRoom`/`SeedUser`/`SeedBooking` (принимают те же опции фикстур),
   `FreshRoomAndUser(t, pool, cleanup)` — типовой пролог подтеста.
+
+Builder — когда нужен конкретный набор полей. Object mother — когда нужен «просто объект». Не создавать model.Booking{...} руками в тестах.

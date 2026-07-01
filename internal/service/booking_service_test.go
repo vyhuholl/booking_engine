@@ -11,6 +11,7 @@ import (
 
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
+	"github.com/example/booking-engine/internal/testutil"
 )
 
 // --- Mocks ---------------------------------------------------------------
@@ -83,15 +84,13 @@ var (
 )
 
 func testRoom(floor int) model.Room {
-	return model.Room{ID: testRoomID, Name: "Room 1", Capacity: 6, Floor: floor, Status: model.RoomStatusActive}
+	return testutil.Room(testutil.WithFloor(floor))
 }
 
 // roomFoundWithStatus — комната существует с произвольным статусом.
 func roomFoundWithStatus(rooms *mockRoomLookup, floor int, status model.RoomStatus) {
 	rooms.getFn = func(_ context.Context, _ string) (model.Room, error) {
-		r := testRoom(floor)
-		r.Status = status
-		return r, nil
+		return testutil.Room(testutil.WithFloor(floor), testutil.WithRoomStatus(status)), nil
 	}
 }
 
@@ -104,13 +103,22 @@ func testActor(role model.Role) Actor {
 	return a
 }
 
-func testInput(start, end time.Time) BookingCreateInput {
+// createInputFrom — извлекает поля BookingCreateInput из готовой брони-фикстуры:
+// builder и object-mother отдают model.Booking, а Create принимает DTO.
+func createInputFrom(b model.Booking) BookingCreateInput {
 	return BookingCreateInput{
-		RoomID:    testRoomID,
-		Title:     "Standup",
-		StartTime: start,
-		EndTime:   end,
+		RoomID:    b.RoomID,
+		Title:     b.Title,
+		StartTime: b.StartTime,
+		EndTime:   b.EndTime,
 	}
+}
+
+// testInput собирает BookingCreateInput через builder брони: явное окно
+// [start, end), остальные поля — дефолты фикстуры.
+func testInput(t *testing.T, start, end time.Time) BookingCreateInput {
+	t.Helper()
+	return createInputFrom(testutil.NewBookingBuilder(t).WithTime(start, end).Build())
 }
 
 func newTestService(rooms *mockRoomLookup, repo *mockBookingRepo) *Booking {
@@ -152,7 +160,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-001 member books free room for 1 hour",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: createInputFrom(testutil.TestBooking(t)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
 				noConflictInsert(repo)
@@ -162,7 +170,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-002 manager books room on own floor",
 			actor: testActor(model.RoleManager),
-			input: testInput(baseStart, baseStart.Add(90*time.Minute)),
+			input: testInput(t, baseStart, baseStart.Add(90*time.Minute)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2) // manager.ManagesFloor == 2
 				noConflictInsert(repo)
@@ -172,7 +180,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-003 admin books any room",
 			actor: testActor(model.RoleAdmin),
-			input: testInput(baseStart, baseEnd),
+			input: createInputFrom(testutil.TestBooking(t)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 5)
 				noConflictInsert(repo)
@@ -184,7 +192,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-004 exactly 15 minutes (lower bound) ok",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseStart.Add(15*time.Minute)),
+			input: testInput(t, baseStart, baseStart.Add(15*time.Minute)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
 				noConflictInsert(repo)
@@ -194,7 +202,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-005 14 minutes (below min) rejected",
 			actor:          testActor(model.RoleMember),
-			input:          testInput(baseStart, baseStart.Add(14*time.Minute)),
+			input:          testInput(t, baseStart, baseStart.Add(14*time.Minute)),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {}, // not reached
 			wantErrIs:      ErrDurationTooShort,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -202,7 +210,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-006 exactly 8 hours (upper bound) ok",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseStart.Add(8*time.Hour)),
+			input: testInput(t, baseStart, baseStart.Add(8*time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
 				noConflictInsert(repo)
@@ -212,7 +220,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-007 8h1m (above max) rejected",
 			actor:          testActor(model.RoleMember),
-			input:          testInput(baseStart, baseStart.Add(8*time.Hour+time.Minute)),
+			input:          testInput(t, baseStart, baseStart.Add(8*time.Hour+time.Minute)),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrIs:      ErrDurationTooLong,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -220,7 +228,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-008 admin also bound by duration min",
 			actor:          testActor(model.RoleAdmin),
-			input:          testInput(baseStart, baseStart.Add(14*time.Minute)),
+			input:          testInput(t, baseStart, baseStart.Add(14*time.Minute)),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrIs:      ErrDurationTooShort,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -230,10 +238,10 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-009 full overlap",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: testInput(t, baseStart, baseEnd),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart, baseEnd)
+				repo.createCheckedFn = conflictAt(t, baseStart, baseEnd)
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -241,10 +249,10 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-010 partial overlap (start inside existing)",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart.Add(time.Hour), baseStart.Add(3*time.Hour)),
+			input: testInput(t, baseStart.Add(time.Hour), baseStart.Add(3*time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart, baseStart.Add(2*time.Hour))
+				repo.createCheckedFn = conflictAt(t, baseStart, baseStart.Add(2*time.Hour))
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -252,10 +260,10 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-011 partial overlap (end inside existing)",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart.Add(-time.Hour), baseStart.Add(time.Hour)),
+			input: testInput(t, baseStart.Add(-time.Hour), baseStart.Add(time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart, baseStart.Add(2*time.Hour))
+				repo.createCheckedFn = conflictAt(t, baseStart, baseStart.Add(2*time.Hour))
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -263,10 +271,10 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-012 request fully inside existing",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart.Add(30*time.Minute), baseStart.Add(90*time.Minute)),
+			input: testInput(t, baseStart.Add(30*time.Minute), baseStart.Add(90*time.Minute)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart, baseStart.Add(2*time.Hour))
+				repo.createCheckedFn = conflictAt(t, baseStart, baseStart.Add(2*time.Hour))
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -274,10 +282,10 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-013 request fully envelops existing",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseStart.Add(2*time.Hour)),
+			input: testInput(t, baseStart, baseStart.Add(2*time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart.Add(30*time.Minute), baseStart.Add(90*time.Minute))
+				repo.createCheckedFn = conflictAt(t, baseStart.Add(30*time.Minute), baseStart.Add(90*time.Minute))
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -285,7 +293,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-014 boundary touch: new starts exactly when old ends",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart.Add(time.Hour), baseStart.Add(2*time.Hour)),
+			input: testInput(t, baseStart.Add(time.Hour), baseStart.Add(2*time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
 				noConflictInsert(repo) // SQL `start < $end AND end > $start` исключает касание
@@ -295,7 +303,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-015 boundary touch: new ends exactly when old starts",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseStart.Add(time.Hour)),
+			input: testInput(t, baseStart, baseStart.Add(time.Hour)),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				roomFound(rooms, 2)
 				noConflictInsert(repo)
@@ -347,7 +355,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-020 start_time in the past",
 			actor:          testActor(model.RoleMember),
-			input:          testInput(fixedNow.Add(-24*time.Hour), fixedNow.Add(-23*time.Hour)),
+			input:          testInput(t, fixedNow.Add(-24*time.Hour), fixedNow.Add(-23*time.Hour)),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrIs:      ErrStartInPast,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -355,7 +363,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-021 end_time == start_time",
 			actor:          testActor(model.RoleMember),
-			input:          testInput(baseStart, baseStart),
+			input:          testInput(t, baseStart, baseStart),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrIs:      ErrInvalidTimeRange,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -363,7 +371,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-022 end_time before start_time",
 			actor:          testActor(model.RoleMember),
-			input:          testInput(baseEnd, baseStart),
+			input:          testInput(t, baseEnd, baseStart),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrIs:      ErrInvalidTimeRange,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -373,7 +381,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-023 room not found",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: testInput(t, baseStart, baseEnd),
 			setupMocks: func(rooms *mockRoomLookup, _ *mockBookingRepo) {
 				rooms.getFn = func(_ context.Context, _ string) (model.Room, error) {
 					return model.Room{}, repository.ErrNotFound
@@ -385,7 +393,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-024 soft-deleted room (repo treats as not found)",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: testInput(t, baseStart, baseEnd),
 			setupMocks: func(rooms *mockRoomLookup, _ *mockBookingRepo) {
 				// Предположение: room-repo фильтрует soft-deleted и возвращает ErrNotFound.
 				rooms.getFn = func(_ context.Context, _ string) (model.Room, error) {
@@ -398,7 +406,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-025 room out_of_service",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: testInput(t, baseStart, baseEnd),
 			setupMocks: func(rooms *mockRoomLookup, _ *mockBookingRepo) {
 				roomFoundWithStatus(rooms, 2, model.RoomStatusOutOfService)
 			},
@@ -410,7 +418,7 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:           "TC-026 unauthenticated request",
 			actor:          Actor{},
-			input:          testInput(baseStart, baseEnd),
+			input:          testInput(t, baseStart, baseEnd),
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantHTTPStatus: http.StatusUnauthorized,
 			skipReason:     "authentication enforced at handler.authMiddleware, not service — covered by handler tests",
@@ -418,12 +426,12 @@ func TestBookingService_Create(t *testing.T) {
 		{
 			name:  "TC-027 race: conflict reported at insert time",
 			actor: testActor(model.RoleMember),
-			input: testInput(baseStart, baseEnd),
+			input: testInput(t, baseStart, baseEnd),
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
 				// Unit-аппроксимация: репозиторий-уровень атомарно обнаружил конфликт.
 				// Полноценный race-сценарий — интеграционный тест с реальной БД.
 				roomFound(rooms, 2)
-				repo.createCheckedFn = conflictAt(baseStart, baseEnd)
+				repo.createCheckedFn = conflictAt(t, baseStart, baseEnd)
 			},
 			wantErrAs:      new(*BookingConflictError),
 			wantHTTPStatus: http.StatusConflict,
@@ -467,17 +475,18 @@ func TestBookingService_Create(t *testing.T) {
 }
 
 // conflictAt — фабрика мок-функции CreateChecked, эмулирующей обнаруженный конфликт.
-func conflictAt(start, end time.Time) func(context.Context, model.Booking) (*model.Booking, error) {
+// Существующую бронь на слот [start, end) собираем builder'ом, а «претендента» на
+// тот же слот — object-mother'ом TestConflictingBooking (та же комната и окно →
+// гарантированное пересечение).
+func conflictAt(t *testing.T, start, end time.Time) func(context.Context, model.Booking) (*model.Booking, error) {
+	t.Helper()
+	existing := testutil.NewBookingBuilder(t).
+		WithRoom(testutil.Room(testutil.WithRoomID(testRoomID))).
+		WithTime(start, end).
+		Build()
+	conflict := testutil.TestConflictingBooking(t, existing)
 	return func(_ context.Context, _ model.Booking) (*model.Booking, error) {
-		return &model.Booking{
-			ID:        "b-existing",
-			RoomID:    testRoomID,
-			UserID:    "user-other",
-			Title:     "existing",
-			StartTime: start,
-			EndTime:   end,
-			Status:    model.StatusConfirmed,
-		}, nil
+		return &conflict, nil
 	}
 }
 
@@ -492,17 +501,17 @@ const (
 // errAny — произвольная не-sentinel ошибка репозитория (для проверки проброса).
 var errAny = errors.New("unexpected repository failure")
 
-// testBooking — бронь с заданным владельцем, началом и статусом (длительность 1 час).
-func testBooking(owner string, start time.Time, status model.BookingStatus) model.Booking {
-	return model.Booking{
-		ID:        testBookingID,
-		RoomID:    testRoomID,
-		UserID:    owner,
-		Title:     "Standup",
-		StartTime: start,
-		EndTime:   start.Add(time.Hour),
-		Status:    status,
-	}
+// testBooking — бронь с заданным владельцем, началом и статусом (длительность 1 час),
+// собранная builder'ом. ID закрепляем за testBookingID: Cancel сверяет got.ID с ним.
+func testBooking(t *testing.T, owner string, start time.Time, status model.BookingStatus) model.Booking {
+	t.Helper()
+	b := testutil.NewBookingBuilder(t).
+		WithUser(testutil.User(testutil.WithUserID(owner))).
+		WithTime(start, start.Add(time.Hour)).
+		WithStatus(string(status)).
+		Build()
+	b.ID = testBookingID
+	return b
 }
 
 // bookingGet — repo.Get возвращает заданную бронь.
@@ -537,7 +546,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
 				cancelOK(repo)
 			},
 			wantHTTPStatus: http.StatusNoContent,
@@ -547,7 +556,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, fixedNow.Add(CancelDeadline), model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, fixedNow.Add(CancelDeadline), model.StatusConfirmed))
 				cancelOK(repo)
 			},
 			wantHTTPStatus: http.StatusNoContent,
@@ -557,7 +566,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, fixedNow.Add(29*time.Minute), model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, fixedNow.Add(29*time.Minute), model.StatusConfirmed))
 			},
 			wantErrIs:      ErrCancelTooLate,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -567,7 +576,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, fixedNow.Add(-15*time.Minute), model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, fixedNow.Add(-15*time.Minute), model.StatusConfirmed))
 			},
 			wantErrIs:      ErrCancelTooLate,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -580,7 +589,7 @@ func TestBookingService_Cancel(t *testing.T) {
 				// Абсолютный момент == now+30m, но хранится в не-UTC зоне.
 				msk := time.FixedZone("MSK", 3*60*60)
 				start := fixedNow.Add(CancelDeadline).In(msk)
-				bookingGet(repo, testBooking(testUserID, start, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, start, model.StatusConfirmed))
 				cancelOK(repo)
 			},
 			wantHTTPStatus: http.StatusNoContent,
@@ -592,7 +601,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 			},
 			wantErrIs:      ErrCancelForbidden,
 			wantHTTPStatus: http.StatusForbidden,
@@ -602,7 +611,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleManager), // ManagesFloor == 2
 			bookingID: testBookingID,
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 				roomFound(rooms, 2)
 				cancelOK(repo)
 			},
@@ -613,7 +622,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleManager),
 			bookingID: testBookingID,
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 				roomFound(rooms, 3)
 			},
 			wantErrIs:      ErrCancelForbidden,
@@ -625,7 +634,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
 				// Владелец — сам менеджер: room lookup не требуется.
-				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
 				cancelOK(repo)
 			},
 			wantHTTPStatus: http.StatusNoContent,
@@ -635,7 +644,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleManager),
 			bookingID: testBookingID,
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testAdminID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testAdminID, baseStart, model.StatusConfirmed))
 				roomFound(rooms, 2)
 				cancelOK(repo)
 			},
@@ -646,7 +655,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleAdmin),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 				cancelOK(repo)
 			},
 			wantHTTPStatus: http.StatusNoContent,
@@ -656,7 +665,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleAdmin),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, fixedNow.Add(20*time.Minute), model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, fixedNow.Add(20*time.Minute), model.StatusConfirmed))
 			},
 			wantErrIs:      ErrCancelTooLate,
 			wantHTTPStatus: http.StatusBadRequest,
@@ -680,7 +689,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusCancelled))
+				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusCancelled))
 			},
 			wantErrIs:      ErrAlreadyCancelled,
 			wantHTTPStatus: http.StatusConflict,
@@ -708,7 +717,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     Actor{ID: testUserID, Role: model.RoleManager}, // ManagesFloor == nil
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 			},
 			wantErrIs:      ErrCancelForbidden,
 			wantHTTPStatus: http.StatusForbidden,
@@ -718,7 +727,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleManager),
 			bookingID: testBookingID,
 			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
 				rooms.getFn = func(_ context.Context, _ string) (model.Room, error) {
 					return model.Room{}, repository.ErrNotFound
 				}
@@ -731,7 +740,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
 				repo.cancelFn = func(_ context.Context, _ string) error {
 					return repository.ErrNotFound
 				}
@@ -756,7 +765,7 @@ func TestBookingService_Cancel(t *testing.T) {
 			actor:     testActor(model.RoleMember),
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
-				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
 				repo.cancelFn = func(_ context.Context, _ string) error { return errAny }
 			},
 			wantErrIs:      errAny,
@@ -797,7 +806,7 @@ func TestBookingService_ListByUser(t *testing.T) {
 	confirmed := model.StatusConfirmed
 	from := baseStart.Add(-24 * time.Hour)
 	to := baseStart.Add(24 * time.Hour)
-	sample := []model.Booking{testBooking(testUserID, baseStart, model.StatusConfirmed)}
+	sample := []model.Booking{testutil.TestBooking(t)}
 
 	type testCase struct {
 		name           string

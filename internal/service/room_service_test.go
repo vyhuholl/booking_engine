@@ -597,7 +597,7 @@ func TestRoomService_Reads(t *testing.T) {
 		}
 		bookings := &mockBookingsForRoom{
 			listByRoomOnDateFn: func(_ context.Context, _ string, _ time.Time) ([]model.Booking, error) {
-				return []model.Booking{testBooking(testUserID, baseStart, model.StatusConfirmed)}, nil
+				return []model.Booking{testBooking(t, testUserID, baseStart, model.StatusConfirmed)}, nil
 			},
 		}
 		svc := newTestRoomService(rooms, bookings)
