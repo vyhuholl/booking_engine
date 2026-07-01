@@ -31,13 +31,26 @@ type RedisCache struct {
 	log    *slog.Logger
 }
 
+// RedisOption настраивает RedisCache при создании.
+type RedisOption func(*RedisCache)
+
+// WithTTL переопределяет время жизни записей (по умолчанию TTL). Нужен прежде
+// всего в тестах, где ждать полный пятиминутный TTL непрактично.
+func WithTTL(d time.Duration) RedisOption {
+	return func(c *RedisCache) { c.ttl = d }
+}
+
 // NewRedis собирает кэш поверх готового клиента. Клиентом владеет вызывающий
 // (он же закрывает его при завершении). log == nil заменяется на slog.Default().
-func NewRedis(client *redis.Client, log *slog.Logger) *RedisCache {
+func NewRedis(client *redis.Client, log *slog.Logger, opts ...RedisOption) *RedisCache {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &RedisCache{client: client, ttl: TTL, log: log}
+	c := &RedisCache{client: client, ttl: TTL, log: log}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // availableKey формирует ключ окна: rooms:available:{start_unix}:{end_unix}.

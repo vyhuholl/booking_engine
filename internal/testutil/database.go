@@ -37,20 +37,30 @@ var (
 func SetupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 
-	sharedOnce.Do(func() {
-		sharedPool, sharedErr = bootPostgres()
-	})
-	if sharedErr != nil {
-		t.Fatalf("setup test db: %v", sharedErr)
+	pool, err := StartPostgres()
+	if err != nil {
+		t.Fatalf("setup test db: %v", err)
 	}
 
 	cleanup := func() {
 		t.Helper()
-		if err := truncateAll(context.Background(), sharedPool); err != nil {
+		if err := truncateAll(context.Background(), pool); err != nil {
 			t.Fatalf("truncate test tables: %v", err)
 		}
 	}
-	return sharedPool, cleanup
+	return pool, cleanup
+}
+
+// StartPostgres поднимает общий контейнер Postgres (один раз на тестовый
+// бинарник) с применёнными миграциями и возвращает пул. В отличие от SetupTestDB
+// не требует *testing.T, поэтому вызывается из TestMain интеграционных наборов,
+// чтобы прогреть контейнер до старта тестов. Контейнер живёт до конца процесса —
+// его останавливает Ryuk-reaper testcontainers.
+func StartPostgres() (*pgxpool.Pool, error) {
+	sharedOnce.Do(func() {
+		sharedPool, sharedErr = bootPostgres()
+	})
+	return sharedPool, sharedErr
 }
 
 func bootPostgres() (*pgxpool.Pool, error) {
