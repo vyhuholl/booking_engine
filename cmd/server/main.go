@@ -112,7 +112,7 @@ func main() {
 				logger.Error("redis close", "err", err)
 			}
 		}()
-		roomCache = cache.NewRedis(rdb)
+		roomCache = cache.NewRedis(rdb, logger)
 		logger.Info("redis cache enabled", "addr", opts.Addr)
 	}
 
@@ -120,7 +120,7 @@ func main() {
 	// (publisher == nil) — сервис просто не публикует события.
 	var publisher events.EventPublisher
 	if len(cfg.KafkaBrokers) > 0 {
-		kp := events.NewKafkaPublisher(cfg.KafkaBrokers)
+		kp := events.NewKafkaPublisher(cfg.KafkaBrokers, logger)
 		defer func() {
 			if err := kp.Close(); err != nil {
 				logger.Error("kafka writer close", "err", err)

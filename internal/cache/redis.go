@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/example/booking-engine/internal/model"
+	"github.com/example/booking-engine/internal/tracing"
 )
 
 const (
@@ -26,12 +28,16 @@ const (
 type RedisCache struct {
 	client *redis.Client
 	ttl    time.Duration
+	log    *slog.Logger
 }
 
 // NewRedis собирает кэш поверх готового клиента. Клиентом владеет вызывающий
-// (он же закрывает его при завершении).
-func NewRedis(client *redis.Client) *RedisCache {
-	return &RedisCache{client: client, ttl: TTL}
+// (он же закрывает его при завершении). log == nil заменяется на slog.Default().
+func NewRedis(client *redis.Client, log *slog.Logger) *RedisCache {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &RedisCache{client: client, ttl: TTL, log: log}
 }
 
 // availableKey формирует ключ окна: rooms:available:{start_unix}:{end_unix}.
@@ -53,6 +59,7 @@ func (c *RedisCache) GetAvailableRooms(ctx context.Context, start, end time.Time
 	if err := json.Unmarshal(data, &rooms); err != nil {
 		return nil, err
 	}
+	c.log.Debug("room cache hit", "trace_id", tracing.TraceID(ctx), "count", len(rooms))
 	return rooms, nil
 }
 
@@ -80,5 +87,9 @@ func (c *RedisCache) InvalidateRoomCache(ctx context.Context, roomID string) err
 	if len(keys) == 0 {
 		return nil
 	}
-	return c.client.Del(ctx, keys...).Err()
+	if err := c.client.Del(ctx, keys...).Err(); err != nil {
+		return err
+	}
+	c.log.Debug("room cache invalidated", "trace_id", tracing.TraceID(ctx), "room_id", roomID, "keys", len(keys))
+	return nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/service"
+	"github.com/example/booking-engine/internal/tracing"
 )
 
 type Handler struct {
@@ -49,6 +50,7 @@ func (h *Handler) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	r.Use(traceMiddleware)
 	r.Use(slogRequestLogger(h.log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
@@ -91,6 +93,18 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// traceMiddleware восстанавливает W3C trace-контекст из заголовка traceparent
+// (или генерирует новый, если клиент его не прислал) и кладёт в context.Context.
+// Дальше тот же контекст тянут service → repository → cache → kafka, а trace_id
+// из него попадает в каждый лог запроса.
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceparent := tracing.EnsureTraceparent(r.Header.Get(tracing.HeaderName))
+		ctx := tracing.WithTraceparent(r.Context(), traceparent)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func slogRequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +118,7 @@ func slogRequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				"bytes", ww.BytesWritten(),
 				"duration_ms", time.Since(start).Milliseconds(),
 				"req_id", middleware.GetReqID(r.Context()),
+				"trace_id", tracing.TraceID(r.Context()),
 			)
 		})
 	}

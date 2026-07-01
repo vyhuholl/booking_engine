@@ -13,6 +13,7 @@ import (
 	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
+	"github.com/example/booking-engine/internal/tracing"
 )
 
 const (
@@ -76,6 +77,10 @@ type BookingCreateInput struct {
 }
 
 func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (model.Booking, error) {
+	// Контекстные поля операции навешиваются один раз на входе и тянутся во все
+	// её логи (booking_id добавляется ниже, когда бронь получает id).
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "room_id", in.RoomID)
+
 	if strings.TrimSpace(in.Title) == "" {
 		return model.Booking{}, &ValidationError{Field: "title", Message: "title is required"}
 	}
@@ -104,6 +109,7 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		if errors.Is(err, repository.ErrNotFound) {
 			return model.Booking{}, ErrRoomNotFound
 		}
+		log.Error("create booking: room lookup", slog.Any("error", err))
 		return model.Booking{}, err
 	}
 	if room.Status == model.RoomStatusOutOfService {
@@ -119,9 +125,11 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		EndTime:   in.EndTime.UTC(),
 		Status:    model.StatusConfirmed,
 	}
+	log = log.With("booking_id", b.ID)
 
 	conflict, err := s.bookings.CreateChecked(ctx, b)
 	if err != nil {
+		log.Error("create booking: persist", slog.Any("error", err))
 		return model.Booking{}, err
 	}
 	if conflict != nil {
@@ -132,24 +140,31 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		}
 	}
 
+	log.Info("booking created")
+
 	// Комната занята на новом интервале — список свободных комнат в затронутых
 	// окнах устарел, сбрасываем кэш доступности.
-	s.invalidateRoomCache(ctx, b.RoomID)
+	s.invalidateRoomCache(ctx, log, b.RoomID)
 
 	// Бронь зафиксирована — публикуем событие. Сбой публикации не откатывает
 	// операцию (eventual consistency), только логируется.
-	s.publishEvent(ctx, events.TypeBookingCreated, b)
+	s.publishEvent(ctx, log, events.TypeBookingCreated, b)
 	return b, nil
 }
 
 func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking, error) {
+	// room_id добавляется ниже, когда бронь прочитана из БД.
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "booking_id", id)
+
 	b, err := s.bookings.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			return model.Booking{}, ErrBookingNotFound
 		}
+		log.Error("cancel booking: lookup", slog.Any("error", err))
 		return model.Booking{}, err
 	}
+	log = log.With("room_id", b.RoomID)
 
 	if b.Status == model.StatusCancelled {
 		return model.Booking{}, ErrAlreadyCancelled
@@ -168,15 +183,18 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 			// гонка: уже отменили между Get и Cancel
 			return model.Booking{}, ErrAlreadyCancelled
 		}
+		log.Error("cancel booking: persist", slog.Any("error", err))
 		return model.Booking{}, err
 	}
 	b.Status = model.StatusCancelled
 
+	log.Info("booking cancelled")
+
 	// Комната освободилась на интервале брони — сбрасываем кэш доступности.
-	s.invalidateRoomCache(ctx, b.RoomID)
+	s.invalidateRoomCache(ctx, log, b.RoomID)
 
 	// Бронь отменена в БД — публикуем событие (см. Create про eventual consistency).
-	s.publishEvent(ctx, events.TypeBookingCancelled, b)
+	s.publishEvent(ctx, log, events.TypeBookingCancelled, b)
 	return b, nil
 }
 
@@ -189,6 +207,8 @@ func (s *Booking) GetAvailableRooms(ctx context.Context, _ Actor, start, end tim
 		return nil, ErrInvalidTimeRange
 	}
 
+	log := s.log.With("trace_id", tracing.TraceID(ctx))
+
 	if s.cache != nil {
 		switch rooms, err := s.cache.GetAvailableRooms(ctx, start, end); {
 		case err == nil:
@@ -196,18 +216,19 @@ func (s *Booking) GetAvailableRooms(ctx context.Context, _ Actor, start, end tim
 		case errors.Is(err, cache.ErrCacheMiss):
 			// промах — идём в БД
 		default:
-			s.log.Warn("room cache get", "err", err) // деградация к БД, запрос не роняем
+			log.Warn("room cache get, falling back to db", slog.Any("error", err)) // деградация, запрос не роняем
 		}
 	}
 
 	rooms, err := s.rooms.Available(ctx, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), nil, nil, nil)
 	if err != nil {
+		log.Error("list available rooms", slog.Any("error", err))
 		return nil, err
 	}
 
 	if s.cache != nil {
 		if err := s.cache.SetAvailableRooms(ctx, start, end, rooms); err != nil {
-			s.log.Warn("room cache set", "err", err)
+			log.Warn("room cache set", slog.Any("error", err))
 		}
 	}
 	return rooms, nil
@@ -215,20 +236,22 @@ func (s *Booking) GetAvailableRooms(ctx context.Context, _ Actor, start, end tim
 
 // invalidateRoomCache сбрасывает кэш доступности после изменения броней комнаты.
 // Кэш опционален и не критичен для корректности (TTL всё равно ограничивает
-// рассогласование): ошибка только логируется. No-op при nil-кэше.
-func (s *Booking) invalidateRoomCache(ctx context.Context, roomID string) {
+// рассогласование): ошибка — это деградация, на которой сервис выжил, поэтому
+// уровень Warn, а не Error. No-op при nil-кэше. log уже несёт контекст операции.
+func (s *Booking) invalidateRoomCache(ctx context.Context, log *slog.Logger, roomID string) {
 	if s.cache == nil {
 		return
 	}
 	if err := s.cache.InvalidateRoomCache(ctx, roomID); err != nil {
-		s.log.Error("invalidate room cache", "err", err, "room_id", roomID)
+		log.Warn("invalidate room cache", slog.Any("error", err))
 	}
 }
 
-// publishEvent публикует событие о брони после успешной записи в БД.
-// Ошибка публикации только логируется: бронь уже зафиксирована, откатывать её
-// из-за недоступной шины нельзя. При nil-паблишере метод — no-op.
-func (s *Booking) publishEvent(ctx context.Context, eventType string, b model.Booking) {
+// publishEvent публикует событие о брони после успешной записи в БД. Сбой
+// публикации — деградация, а не провал операции: бронь уже зафиксирована,
+// откатывать её из-за недоступной шины нельзя, поэтому уровень Warn. При
+// nil-паблишере метод — no-op. log уже несёт контекст операции.
+func (s *Booking) publishEvent(ctx context.Context, log *slog.Logger, eventType string, b model.Booking) {
 	if s.publisher == nil {
 		return
 	}
@@ -240,10 +263,9 @@ func (s *Booking) publishEvent(ctx context.Context, eventType string, b model.Bo
 		Timestamp: s.now(),
 	}
 	if err := s.publisher.Publish(ctx, s.topic, ev); err != nil {
-		s.log.Error("publish booking event",
-			"err", err,
+		log.Warn("publish booking event, kafka unavailable",
+			slog.Any("error", err),
 			"type", eventType,
-			"booking_id", b.ID,
 			"topic", s.topic,
 		)
 	}

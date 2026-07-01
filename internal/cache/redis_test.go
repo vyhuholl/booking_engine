@@ -22,7 +22,7 @@ func newTestCache(t *testing.T) (*cache.RedisCache, *miniredis.Miniredis) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	return cache.NewRedis(client), mr
+	return cache.NewRedis(client, nil), mr
 }
 
 var (
