@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
 )
@@ -34,13 +36,29 @@ type RoomLookup interface {
 }
 
 type Booking struct {
-	rooms    RoomLookup
-	bookings BookingRepo
-	now      func() time.Time
+	rooms     RoomLookup
+	bookings  BookingRepo
+	publisher events.EventPublisher
+	topic     string
+	log       *slog.Logger
+	now       func() time.Time
 }
 
-func NewBooking(rooms RoomLookup, bookings BookingRepo) *Booking {
-	return &Booking{rooms: rooms, bookings: bookings, now: time.Now}
+// NewBooking собирает сервис бронирования. publisher может быть nil (тогда
+// события не публикуются — например, в окружении без Kafka); log == nil
+// заменяется на slog.Default().
+func NewBooking(rooms RoomLookup, bookings BookingRepo, publisher events.EventPublisher, topic string, log *slog.Logger) *Booking {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Booking{
+		rooms:     rooms,
+		bookings:  bookings,
+		publisher: publisher,
+		topic:     topic,
+		log:       log,
+		now:       time.Now,
+	}
 }
 
 type BookingCreateInput struct {
@@ -106,6 +124,10 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 			ConflictingEnd:   conflict.EndTime,
 		}
 	}
+
+	// Бронь зафиксирована — публикуем событие. Сбой публикации не откатывает
+	// операцию (eventual consistency), только логируется.
+	s.publishEvent(ctx, events.TypeBookingCreated, b)
 	return b, nil
 }
 
@@ -138,7 +160,34 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 		return model.Booking{}, err
 	}
 	b.Status = model.StatusCancelled
+
+	// Бронь отменена в БД — публикуем событие (см. Create про eventual consistency).
+	s.publishEvent(ctx, events.TypeBookingCancelled, b)
 	return b, nil
+}
+
+// publishEvent публикует событие о брони после успешной записи в БД.
+// Ошибка публикации только логируется: бронь уже зафиксирована, откатывать её
+// из-за недоступной шины нельзя. При nil-паблишере метод — no-op.
+func (s *Booking) publishEvent(ctx context.Context, eventType string, b model.Booking) {
+	if s.publisher == nil {
+		return
+	}
+	ev := events.Event{
+		Type:      eventType,
+		BookingID: b.ID,
+		UserID:    b.UserID,
+		RoomID:    b.RoomID,
+		Timestamp: s.now(),
+	}
+	if err := s.publisher.Publish(ctx, s.topic, ev); err != nil {
+		s.log.Error("publish booking event",
+			"err", err,
+			"type", eventType,
+			"booking_id", b.ID,
+			"topic", s.topic,
+		)
+	}
 }
 
 func (s *Booking) checkCancelPermission(ctx context.Context, a Actor, b model.Booking) error {

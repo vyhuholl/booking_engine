@@ -7,27 +7,33 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/handler"
 	"github.com/example/booking-engine/internal/repository"
 	"github.com/example/booking-engine/internal/service"
 )
 
 type config struct {
-	HTTPAddr    string
-	DatabaseURL string
-	JWTSecret   string
+	HTTPAddr     string
+	DatabaseURL  string
+	JWTSecret    string
+	KafkaBrokers []string
+	KafkaTopic   string
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		HTTPAddr:    getenv("HTTP_ADDR", ":8080"),
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		JWTSecret:   os.Getenv("JWT_SECRET"),
+		HTTPAddr:     getenv("HTTP_ADDR", ":8080"),
+		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		JWTSecret:    os.Getenv("JWT_SECRET"),
+		KafkaBrokers: splitAndTrim(os.Getenv("KAFKA_BROKERS")),
+		KafkaTopic:   getenv("KAFKA_TOPIC", "booking.events"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -36,6 +42,18 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("JWT_SECRET is required")
 	}
 	return cfg, nil
+}
+
+// splitAndTrim разбивает список брокеров "host1:9092,host2:9092" на элементы,
+// отбрасывая пустые. Пустая строка даёт nil — Kafka выключена.
+func splitAndTrim(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getenv(k, def string) string {
@@ -74,8 +92,22 @@ func main() {
 	bookings := repository.NewBooking(pool)
 	users := repository.NewUser(pool)
 
+	// Публикация событий в Kafka. Без KAFKA_BROKERS паблишер не создаётся
+	// (publisher == nil) — сервис просто не публикует события.
+	var publisher events.EventPublisher
+	if len(cfg.KafkaBrokers) > 0 {
+		kp := events.NewKafkaPublisher(cfg.KafkaBrokers)
+		defer func() {
+			if err := kp.Close(); err != nil {
+				logger.Error("kafka writer close", "err", err)
+			}
+		}()
+		publisher = kp
+		logger.Info("kafka publisher enabled", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic)
+	}
+
 	roomSvc := service.NewRoom(rooms, bookings)
-	bookingSvc := service.NewBooking(rooms, bookings)
+	bookingSvc := service.NewBooking(rooms, bookings, publisher, cfg.KafkaTopic, logger)
 	userSvc := service.NewUser(users)
 
 	h := handler.New(logger, cfg.JWTSecret, users, roomSvc, bookingSvc, userSvc)

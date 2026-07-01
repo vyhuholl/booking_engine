@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
 	"github.com/example/booking-engine/internal/testutil"
@@ -70,6 +72,34 @@ func (m *mockRoomLookup) Get(ctx context.Context, id string) (model.Room, error)
 	return m.getFn(ctx, id)
 }
 
+// mockPublisher — записывающий спай EventPublisher. В отличие от репозиторных
+// моков не паникует при незаданном поведении: публикация — ожидаемый побочный
+// эффект успешной операции. Если err != nil, Publish возвращает её (имитация
+// недоступной шины).
+type mockPublisher struct {
+	mu        sync.Mutex
+	err       error
+	published []publishedEvent
+}
+
+type publishedEvent struct {
+	topic string
+	event events.Event
+}
+
+func (m *mockPublisher) Publish(_ context.Context, topic string, e events.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.published = append(m.published, publishedEvent{topic: topic, event: e})
+	return m.err
+}
+
+func (m *mockPublisher) calls() []publishedEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]publishedEvent(nil), m.published...)
+}
+
 // --- Fixtures ------------------------------------------------------------
 
 const (
@@ -121,8 +151,14 @@ func testInput(t *testing.T, start, end time.Time) BookingCreateInput {
 	return createInputFrom(testutil.NewBookingBuilder(t).WithTime(start, end).Build())
 }
 
+const testTopic = "booking.events"
+
 func newTestService(rooms *mockRoomLookup, repo *mockBookingRepo) *Booking {
-	s := NewBooking(rooms, repo)
+	return newTestServiceWithPublisher(rooms, repo, &mockPublisher{})
+}
+
+func newTestServiceWithPublisher(rooms *mockRoomLookup, repo *mockBookingRepo, pub events.EventPublisher) *Booking {
+	s := NewBooking(rooms, repo, pub, testTopic, nil)
 	s.now = func() time.Time { return fixedNow }
 	return s
 }
@@ -798,6 +834,122 @@ func TestBookingService_Cancel(t *testing.T) {
 			assert.Equal(t, model.StatusCancelled, got.Status, "booking marked cancelled")
 		})
 	}
+}
+
+// --- Event publishing tests ---------------------------------------------
+
+// TestBookingService_Create_PublishesEvent: успешный Create публикует ровно
+// одно событие booking.created в нужный топик с полями брони.
+func TestBookingService_Create_PublishesEvent(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	repo := &mockBookingRepo{}
+	roomFound(rooms, 2)
+	noConflictInsert(repo)
+
+	pub := &mockPublisher{}
+	svc := newTestServiceWithPublisher(rooms, repo, pub)
+
+	actor := testActor(model.RoleMember)
+	got, err := svc.Create(context.Background(), actor, testInput(t, baseStart, baseEnd))
+	assert.NoError(t, err)
+
+	calls := pub.calls()
+	assert.Len(t, calls, 1, "exactly one event published")
+	assert.Equal(t, testTopic, calls[0].topic)
+	ev := calls[0].event
+	assert.Equal(t, events.TypeBookingCreated, ev.Type)
+	assert.Equal(t, got.ID, ev.BookingID)
+	assert.Equal(t, actor.ID, ev.UserID)
+	assert.Equal(t, got.RoomID, ev.RoomID)
+	assert.True(t, ev.Timestamp.Equal(fixedNow), "timestamp taken from service clock")
+}
+
+// TestBookingService_Create_PublishFailureDoesNotFail: сбой публикации не
+// откатывает бронь — Create возвращает её без ошибки (eventual consistency).
+func TestBookingService_Create_PublishFailureDoesNotFail(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	repo := &mockBookingRepo{}
+	roomFound(rooms, 2)
+	noConflictInsert(repo)
+
+	pub := &mockPublisher{err: errAny}
+	svc := newTestServiceWithPublisher(rooms, repo, pub)
+
+	got, err := svc.Create(context.Background(), testActor(model.RoleMember), testInput(t, baseStart, baseEnd))
+	assert.NoError(t, err, "publish failure must not fail the booking")
+	assert.NotEmpty(t, got.ID)
+	assert.Len(t, pub.calls(), 1, "publish was attempted")
+}
+
+// TestBookingService_Create_NoEventOnFailure: если бронь не создана
+// (валидация/конфликт), событие не публикуется.
+func TestBookingService_Create_NoEventOnFailure(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	repo := &mockBookingRepo{}
+	roomFound(rooms, 2)
+	repo.createCheckedFn = conflictAt(t, baseStart, baseEnd)
+
+	pub := &mockPublisher{}
+	svc := newTestServiceWithPublisher(rooms, repo, pub)
+
+	_, err := svc.Create(context.Background(), testActor(model.RoleMember), testInput(t, baseStart, baseEnd))
+	assert.Error(t, err)
+	assert.Empty(t, pub.calls(), "no event on failed create")
+}
+
+// TestBookingService_Cancel_PublishesEvent: успешный Cancel публикует ровно
+// одно событие booking.cancelled.
+func TestBookingService_Cancel_PublishesEvent(t *testing.T) {
+	repo := &mockBookingRepo{}
+	b := testBooking(t, testUserID, baseStart, model.StatusConfirmed)
+	bookingGet(repo, b)
+	cancelOK(repo)
+
+	pub := &mockPublisher{}
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, repo, pub)
+
+	_, err := svc.Cancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.NoError(t, err)
+
+	calls := pub.calls()
+	assert.Len(t, calls, 1)
+	assert.Equal(t, testTopic, calls[0].topic)
+	ev := calls[0].event
+	assert.Equal(t, events.TypeBookingCancelled, ev.Type)
+	assert.Equal(t, b.ID, ev.BookingID)
+	assert.Equal(t, b.UserID, ev.UserID)
+	assert.Equal(t, b.RoomID, ev.RoomID)
+	assert.True(t, ev.Timestamp.Equal(fixedNow))
+}
+
+// TestBookingService_Cancel_PublishFailureDoesNotFail: сбой публикации не
+// откатывает отмену.
+func TestBookingService_Cancel_PublishFailureDoesNotFail(t *testing.T) {
+	repo := &mockBookingRepo{}
+	bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
+	cancelOK(repo)
+
+	pub := &mockPublisher{err: errAny}
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, repo, pub)
+
+	got, err := svc.Cancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.NoError(t, err)
+	assert.Equal(t, model.StatusCancelled, got.Status)
+	assert.Len(t, pub.calls(), 1, "publish was attempted")
+}
+
+// TestBookingService_Cancel_NoEventOnFailure: отклонённая отмена (нет прав)
+// не публикует событие.
+func TestBookingService_Cancel_NoEventOnFailure(t *testing.T) {
+	repo := &mockBookingRepo{}
+	bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
+
+	pub := &mockPublisher{}
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, repo, pub)
+
+	_, err := svc.Cancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.ErrorIs(t, err, ErrCancelForbidden)
+	assert.Empty(t, pub.calls(), "no event on forbidden cancel")
 }
 
 // --- ListByUser tests ----------------------------------------------------

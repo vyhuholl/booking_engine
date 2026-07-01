@@ -52,7 +52,7 @@ func TestBookingService_Create_ConcurrentDoubleBooking(t *testing.T) {
 	user1 := seedMember(t, pool)
 	user2 := seedMember(t, pool)
 
-	svc := service.NewBooking(repository.NewRoom(pool), repository.NewBooking(pool))
+	svc := service.NewBooking(repository.NewRoom(pool), repository.NewBooking(pool), nil, "booking.events", nil)
 
 	// Завтра 10:00–11:00 UTC — гарантированно в будущем для проверки now() в сервисе.
 	now := time.Now().UTC()
