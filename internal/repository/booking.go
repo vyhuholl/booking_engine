@@ -129,6 +129,27 @@ func (r *Booking) ListByRoomOnDate(ctx context.Context, roomID string, date time
 	return scanBookings(rows)
 }
 
+// ListByRoomInPeriod возвращает бронирования комнаты, чей start_time попадает
+// в полуоткрытый интервал [from, to), отсортированные по времени начала.
+// Как и ListByRoomOnDate/CountByRoomInPeriod, учитываются брони в любом статусе —
+// это картина использования комнаты, а не только подтверждённых броней.
+func (r *Booking) ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error) {
+	rows, err := r.pool.Query(ctx, `
+        SELECT id, room_id, user_id, title, start_time, end_time, status
+          FROM bookings
+         WHERE room_id    = $1
+           AND start_time >= $2
+           AND start_time <  $3
+         ORDER BY start_time`,
+		roomID, from, to,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBookings(rows)
+}
+
 // CountByRoomInPeriod возвращает число бронирований комнаты, чей start_time
 // попадает в полуоткрытый интервал [from, to). Учитываются брони в любом
 // статусе (как и ListByRoomOnDate — это картина использования комнаты, а не

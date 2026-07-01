@@ -262,6 +262,67 @@ func TestBooking_CountByRoomInPeriod(t *testing.T) {
 	})
 }
 
+func TestBooking_ListByRoomInPeriod(t *testing.T) {
+	pool, cleanup := testutil.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	repo := repository.NewBooking(pool)
+	ctx := context.Background()
+	from := time.Date(2030, 5, 20, 0, 0, 0, 0, time.UTC) // понедельник
+	to := from.AddDate(0, 0, 7)
+
+	t.Run("returns room's bookings with start in [from, to) ordered by start_time", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		otherRoom := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		// В окне (вставляем не по порядку, чтобы проверить ORDER BY start_time).
+		wed := newBooking(roomID, userID, from.AddDate(0, 0, 2).Add(10*time.Hour), time.Hour)
+		mon := newBooking(roomID, userID, from.Add(9*time.Hour), time.Hour)
+		// Границы полуоткрытого интервала.
+		before := newBooking(roomID, userID, from.Add(-time.Hour), time.Hour)
+		atUpper := newBooking(roomID, userID, to, time.Hour) // to исключается
+		// Другая комната — не попадает в выборку.
+		other := newBooking(otherRoom, userID, from.Add(48*time.Hour), time.Hour)
+
+		for _, b := range []model.Booking{wed, mon, before, atUpper, other} {
+			_, err := repo.CreateChecked(ctx, b)
+			require.NoError(t, err)
+		}
+
+		got, err := repo.ListByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		assert.Equal(t, mon.ID, got[0].ID, "ordered by start_time ascending")
+		assert.Equal(t, wed.ID, got[1].ID)
+	})
+
+	t.Run("cancelled bookings are included", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		b := newBooking(roomID, userID, from.Add(24*time.Hour), time.Hour)
+		_, err := repo.CreateChecked(ctx, b)
+		require.NoError(t, err)
+		require.NoError(t, repo.Cancel(ctx, b.ID))
+
+		got, err := repo.ListByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, model.StatusCancelled, got[0].Status)
+	})
+
+	t.Run("room without bookings in the period returns empty", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+
+		got, err := repo.ListByRoomInPeriod(ctx, roomID, from, to)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+}
+
 func TestBooking_Cancel(t *testing.T) {
 	pool, cleanup := testutil.SetupTestDB(t)
 	t.Cleanup(cleanup)

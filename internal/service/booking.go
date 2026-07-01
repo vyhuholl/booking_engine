@@ -16,6 +16,9 @@ const (
 	MinBookingDuration = 15 * time.Minute
 	MaxBookingDuration = 8 * time.Hour
 	CancelDeadline     = 30 * time.Minute
+
+	// DaysPerWeek — размер окна недельного отчёта (WeeklyReport.Days).
+	DaysPerWeek = 7
 )
 
 type BookingRepo interface {
@@ -23,6 +26,7 @@ type BookingRepo interface {
 	CreateChecked(ctx context.Context, b model.Booking) (*model.Booking, error)
 	Cancel(ctx context.Context, id string) error
 	ListByUser(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
+	ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
 type RoomLookup interface {
@@ -174,4 +178,74 @@ func (s *Booking) ListByUser(ctx context.Context, a Actor, q UserBookingsQuery) 
 		From:   q.From,
 		To:     q.To,
 	})
+}
+
+// DayBookings — бронирования одного дня недельного отчёта.
+type DayBookings struct {
+	Date     time.Time       // начало суток в UTC
+	Bookings []model.Booking // брони, начинающиеся в этот день (может быть пустым, не nil)
+}
+
+// WeeklyReport — отчёт по бронированиям комнаты за неделю [WeekStart, WeekEnd),
+// сгруппированный по дням. Days всегда содержит ровно DaysPerWeek элементов,
+// по одному на каждый день, начиная с WeekStart.
+type WeeklyReport struct {
+	RoomID    string
+	WeekStart time.Time
+	WeekEnd   time.Time // эксклюзивная граница: WeekStart + 7 суток
+	Days      []DayBookings
+}
+
+// GetWeeklyReport возвращает бронирования комнаты за неделю, начинающуюся с weekStart,
+// сгруппированные по дням. weekStart нормализуется к началу суток в UTC. Как и остальные
+// отчёты об использовании комнаты, учитываются брони в любом статусе; группировка идёт
+// по дню start_time. Права не проверяются — отчёт доступен любому аутентифицированному
+// пользователю (аналогично Room.Stats/BookingsOnDate).
+func (s *Booking) GetWeeklyReport(ctx context.Context, _ Actor, roomID string, weekStart time.Time) (WeeklyReport, error) {
+	if strings.TrimSpace(roomID) == "" {
+		return WeeklyReport{}, &ValidationError{Field: "room_id", Message: "room_id is required"}
+	}
+	if weekStart.IsZero() {
+		return WeeklyReport{}, &ValidationError{Field: "week_start", Message: "week_start is required"}
+	}
+
+	if _, err := s.rooms.Get(ctx, roomID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return WeeklyReport{}, ErrRoomNotFound
+		}
+		return WeeklyReport{}, err
+	}
+
+	weekStart = weekStart.UTC()
+	dayStart := time.Date(weekStart.Year(), weekStart.Month(), weekStart.Day(), 0, 0, 0, 0, time.UTC)
+	weekEnd := dayStart.AddDate(0, 0, DaysPerWeek)
+
+	bookings, err := s.bookings.ListByRoomInPeriod(ctx, roomID, dayStart, weekEnd)
+	if err != nil {
+		return WeeklyReport{}, err
+	}
+
+	days := make([]DayBookings, DaysPerWeek)
+	for i := range days {
+		days[i] = DayBookings{
+			Date:     dayStart.AddDate(0, 0, i),
+			Bookings: []model.Booking{},
+		}
+	}
+	// В UTC нет переходов на летнее время, поэтому сутки ровно 24 часа и индекс дня
+	// однозначно определяется смещением start_time от начала недели.
+	for _, b := range bookings {
+		idx := int(b.StartTime.UTC().Sub(dayStart) / (24 * time.Hour))
+		if idx < 0 || idx >= DaysPerWeek {
+			continue // страховка: репозиторий такие записи не возвращает
+		}
+		days[idx].Bookings = append(days[idx].Bookings, b)
+	}
+
+	return WeeklyReport{
+		RoomID:    roomID,
+		WeekStart: dayStart,
+		WeekEnd:   weekEnd,
+		Days:      days,
+	}, nil
 }

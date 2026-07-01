@@ -20,6 +20,7 @@ type mockBookingRepo struct {
 	createCheckedFn func(ctx context.Context, b model.Booking) (*model.Booking, error)
 	cancelFn        func(ctx context.Context, id string) error
 	listByUserFn    func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
+	listByRoomFn    func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
 func (m *mockBookingRepo) Get(ctx context.Context, id string) (model.Booking, error) {
@@ -48,6 +49,13 @@ func (m *mockBookingRepo) ListByUser(ctx context.Context, f repository.UserBooki
 		panic("mockBookingRepo.ListByUser: not set up")
 	}
 	return m.listByUserFn(ctx, f)
+}
+
+func (m *mockBookingRepo) ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error) {
+	if m.listByRoomFn == nil {
+		panic("mockBookingRepo.ListByRoomInPeriod: not set up")
+	}
+	return m.listByRoomFn(ctx, roomID, from, to)
 }
 
 type mockRoomLookup struct {
