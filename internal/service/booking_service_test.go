@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/example/booking-engine/internal/cache"
 	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
@@ -62,7 +63,8 @@ func (m *mockBookingRepo) ListByRoomInPeriod(ctx context.Context, roomID string,
 }
 
 type mockRoomLookup struct {
-	getFn func(ctx context.Context, id string) (model.Room, error)
+	getFn       func(ctx context.Context, id string) (model.Room, error)
+	availableFn func(ctx context.Context, start, end string, capacityMin *int, floor *int, equipment []string) ([]model.Room, error)
 }
 
 func (m *mockRoomLookup) Get(ctx context.Context, id string) (model.Room, error) {
@@ -70,6 +72,43 @@ func (m *mockRoomLookup) Get(ctx context.Context, id string) (model.Room, error)
 		panic("mockRoomLookup.Get: not set up")
 	}
 	return m.getFn(ctx, id)
+}
+
+func (m *mockRoomLookup) Available(ctx context.Context, start, end string, capacityMin *int, floor *int, equipment []string) ([]model.Room, error) {
+	if m.availableFn == nil {
+		panic("mockRoomLookup.Available: not set up")
+	}
+	return m.availableFn(ctx, start, end, capacityMin, floor, equipment)
+}
+
+// mockRoomCache — ручной мок RoomCacheInterface. Как и репозиторные моки,
+// паникует на незаданном методе: это ловит вызовы, которых тест не ожидал
+// (напр. поход в кэш, когда должен был сработать быстрый путь).
+type mockRoomCache struct {
+	getFn        func(ctx context.Context, start, end time.Time) ([]model.Room, error)
+	setFn        func(ctx context.Context, start, end time.Time, rooms []model.Room) error
+	invalidateFn func(ctx context.Context, roomID string) error
+}
+
+func (m *mockRoomCache) GetAvailableRooms(ctx context.Context, start, end time.Time) ([]model.Room, error) {
+	if m.getFn == nil {
+		panic("mockRoomCache.GetAvailableRooms: not set up")
+	}
+	return m.getFn(ctx, start, end)
+}
+
+func (m *mockRoomCache) SetAvailableRooms(ctx context.Context, start, end time.Time, rooms []model.Room) error {
+	if m.setFn == nil {
+		panic("mockRoomCache.SetAvailableRooms: not set up")
+	}
+	return m.setFn(ctx, start, end, rooms)
+}
+
+func (m *mockRoomCache) InvalidateRoomCache(ctx context.Context, roomID string) error {
+	if m.invalidateFn == nil {
+		panic("mockRoomCache.InvalidateRoomCache: not set up")
+	}
+	return m.invalidateFn(ctx, roomID)
 }
 
 // mockPublisher — записывающий спай EventPublisher. В отличие от репозиторных
@@ -158,7 +197,15 @@ func newTestService(rooms *mockRoomLookup, repo *mockBookingRepo) *Booking {
 }
 
 func newTestServiceWithPublisher(rooms *mockRoomLookup, repo *mockBookingRepo, pub events.EventPublisher) *Booking {
-	s := NewBooking(rooms, repo, pub, testTopic, nil)
+	s := NewBooking(rooms, repo, nil, pub, testTopic, nil)
+	s.now = func() time.Time { return fixedNow }
+	return s
+}
+
+// newTestServiceWithCache собирает сервис с заданным кэшем (и записывающим
+// паблишером, чтобы публикация не мешала проверкам кэша).
+func newTestServiceWithCache(rooms *mockRoomLookup, repo *mockBookingRepo, c cache.RoomCacheInterface) *Booking {
+	s := NewBooking(rooms, repo, c, &mockPublisher{}, testTopic, nil)
 	s.now = func() time.Time { return fixedNow }
 	return s
 }
@@ -1067,6 +1114,215 @@ func TestBookingService_ListByUser(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Room availability cache --------------------------------------------
+
+// TestBookingService_GetAvailableRooms проверяет путь кэш → БД → кэш и его
+// деградацию: промах и ошибки кэша уводят в БД, но не роняют запрос.
+func TestBookingService_GetAvailableRooms(t *testing.T) {
+	start, end := baseStart, baseEnd
+	sample := []model.Room{testutil.Room()}
+
+	// availableReturns настраивает БД-источник и сверяет переданное окно (UTC RFC3339)
+	// и то, что фильтры не заданы (метод берёт только временное окно).
+	availableReturns := func(out []model.Room, err error) func(*mockRoomLookup) {
+		return func(rooms *mockRoomLookup) {
+			rooms.availableFn = func(_ context.Context, s, e string, capMin, floor *int, eq []string) ([]model.Room, error) {
+				assert.Equal(t, start.UTC().Format(time.RFC3339), s)
+				assert.Equal(t, end.UTC().Format(time.RFC3339), e)
+				assert.Nil(t, capMin)
+				assert.Nil(t, floor)
+				assert.Nil(t, eq)
+				return out, err
+			}
+		}
+	}
+
+	t.Run("cache hit returns cached rooms without touching DB", func(t *testing.T) {
+		rooms := &mockRoomLookup{} // availableFn не задан → паника, если пойдём в БД
+		c := &mockRoomCache{
+			getFn: func(_ context.Context, s, e time.Time) ([]model.Room, error) {
+				assert.True(t, s.Equal(start))
+				assert.True(t, e.Equal(end))
+				return sample, nil
+			},
+		}
+		svc := newTestServiceWithCache(rooms, &mockBookingRepo{}, c)
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.NoError(t, err)
+		assert.Equal(t, sample, got)
+	})
+
+	t.Run("cache miss falls through to DB and populates cache", func(t *testing.T) {
+		rooms := &mockRoomLookup{}
+		availableReturns(sample, nil)(rooms)
+
+		var cached []model.Room
+		var setCalled bool
+		c := &mockRoomCache{
+			getFn: func(_ context.Context, _, _ time.Time) ([]model.Room, error) {
+				return nil, cache.ErrCacheMiss
+			},
+			setFn: func(_ context.Context, s, e time.Time, rs []model.Room) error {
+				setCalled = true
+				cached = rs
+				assert.True(t, s.Equal(start))
+				assert.True(t, e.Equal(end))
+				return nil
+			},
+		}
+		svc := newTestServiceWithCache(rooms, &mockBookingRepo{}, c)
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.NoError(t, err)
+		assert.Equal(t, sample, got)
+		assert.True(t, setCalled, "результат из БД должен быть закэширован")
+		assert.Equal(t, sample, cached)
+	})
+
+	t.Run("cache get error degrades to DB", func(t *testing.T) {
+		rooms := &mockRoomLookup{}
+		availableReturns(sample, nil)(rooms)
+
+		c := &mockRoomCache{
+			getFn: func(_ context.Context, _, _ time.Time) ([]model.Room, error) {
+				return nil, errAny // не ErrCacheMiss: настоящий сбой Redis
+			},
+			setFn: func(_ context.Context, _, _ time.Time, _ []model.Room) error { return nil },
+		}
+		svc := newTestServiceWithCache(rooms, &mockBookingRepo{}, c)
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.NoError(t, err, "сбой кэша не должен ронять запрос")
+		assert.Equal(t, sample, got)
+	})
+
+	t.Run("cache set error does not fail the request", func(t *testing.T) {
+		rooms := &mockRoomLookup{}
+		availableReturns(sample, nil)(rooms)
+
+		c := &mockRoomCache{
+			getFn: func(_ context.Context, _, _ time.Time) ([]model.Room, error) { return nil, cache.ErrCacheMiss },
+			setFn: func(_ context.Context, _, _ time.Time, _ []model.Room) error { return errAny },
+		}
+		svc := newTestServiceWithCache(rooms, &mockBookingRepo{}, c)
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.NoError(t, err)
+		assert.Equal(t, sample, got)
+	})
+
+	t.Run("nil cache goes straight to DB", func(t *testing.T) {
+		rooms := &mockRoomLookup{}
+		availableReturns(sample, nil)(rooms)
+		svc := newTestService(rooms, &mockBookingRepo{}) // кэш == nil
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.NoError(t, err)
+		assert.Equal(t, sample, got)
+	})
+
+	t.Run("DB error is propagated and not cached", func(t *testing.T) {
+		rooms := &mockRoomLookup{}
+		availableReturns(nil, errAny)(rooms)
+
+		c := &mockRoomCache{
+			getFn: func(_ context.Context, _, _ time.Time) ([]model.Room, error) { return nil, cache.ErrCacheMiss },
+			// setFn не задан → паника, если попытаемся закэшировать ошибку
+		}
+		svc := newTestServiceWithCache(rooms, &mockBookingRepo{}, c)
+
+		got, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), start, end)
+		assert.ErrorIs(t, err, errAny)
+		assert.Nil(t, got)
+	})
+
+	t.Run("invalid time range rejected before cache or DB", func(t *testing.T) {
+		// Ни кэш, ни БД не заданы → любой их вызов паникует.
+		svc := newTestServiceWithCache(&mockRoomLookup{}, &mockBookingRepo{}, &mockRoomCache{})
+
+		_, err := svc.GetAvailableRooms(context.Background(), testActor(model.RoleMember), end, start)
+		assert.ErrorIs(t, err, ErrInvalidTimeRange)
+	})
+}
+
+// TestBookingService_Create_InvalidatesCache: успешный Create сбрасывает кэш
+// доступности комнаты брони.
+func TestBookingService_Create_InvalidatesCache(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	roomFound(rooms, 2)
+	repo := &mockBookingRepo{}
+	noConflictInsert(repo)
+
+	var invalidated []string
+	c := &mockRoomCache{
+		invalidateFn: func(_ context.Context, roomID string) error {
+			invalidated = append(invalidated, roomID)
+			return nil
+		},
+	}
+	svc := newTestServiceWithCache(rooms, repo, c)
+
+	got, err := svc.Create(context.Background(), testActor(model.RoleMember), testInput(t, baseStart, baseEnd))
+	assert.NoError(t, err)
+	assert.Equal(t, []string{got.RoomID}, invalidated, "созданная бронь инвалидирует кэш своей комнаты")
+}
+
+// TestBookingService_Cancel_InvalidatesCache: успешный Cancel сбрасывает кэш
+// доступности комнаты брони.
+func TestBookingService_Cancel_InvalidatesCache(t *testing.T) {
+	repo := &mockBookingRepo{}
+	b := testBooking(t, testUserID, baseStart, model.StatusConfirmed)
+	bookingGet(repo, b)
+	cancelOK(repo)
+
+	var invalidated []string
+	c := &mockRoomCache{
+		invalidateFn: func(_ context.Context, roomID string) error {
+			invalidated = append(invalidated, roomID)
+			return nil
+		},
+	}
+	svc := newTestServiceWithCache(&mockRoomLookup{}, repo, c)
+
+	_, err := svc.Cancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{b.RoomID}, invalidated)
+}
+
+// TestBookingService_Create_NoCacheInvalidationOnFailure: отклонённый Create
+// (конфликт) не трогает кэш — invalidateFn не задан, любой вызов паникует.
+func TestBookingService_Create_NoCacheInvalidationOnFailure(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	roomFound(rooms, 2)
+	repo := &mockBookingRepo{}
+	repo.createCheckedFn = conflictAt(t, baseStart, baseEnd)
+
+	svc := newTestServiceWithCache(rooms, repo, &mockRoomCache{})
+
+	_, err := svc.Create(context.Background(), testActor(model.RoleMember), testInput(t, baseStart, baseEnd))
+	assert.Error(t, err)
+}
+
+// TestBookingService_Create_CacheInvalidationErrorDoesNotFail: сбой инвалидации
+// кэша не откатывает уже зафиксированную бронь (TTL всё равно ограничит
+// рассогласование).
+func TestBookingService_Create_CacheInvalidationErrorDoesNotFail(t *testing.T) {
+	rooms := &mockRoomLookup{}
+	roomFound(rooms, 2)
+	repo := &mockBookingRepo{}
+	noConflictInsert(repo)
+
+	c := &mockRoomCache{
+		invalidateFn: func(_ context.Context, _ string) error { return errAny },
+	}
+	svc := newTestServiceWithCache(rooms, repo, c)
+
+	got, err := svc.Create(context.Background(), testActor(model.RoleMember), testInput(t, baseStart, baseEnd))
+	assert.NoError(t, err, "сбой инвалидации кэша не должен ронять бронь")
+	assert.NotEmpty(t, got.ID)
 }
 
 // --- Error type messages -------------------------------------------------

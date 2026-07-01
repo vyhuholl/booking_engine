@@ -149,7 +149,18 @@ func (h *Handler) searchAvailableRooms(w http.ResponseWriter, r *http.Request) {
 		query.Equipment = append(query.Equipment, model.Equipment(e))
 	}
 
-	rooms, err := h.rooms.Available(r.Context(), actorFromCtx(r.Context()), query)
+	ctx := r.Context()
+	actor := actorFromCtx(ctx)
+
+	// Кэш доступности ключуется только окном [start, end) и не учитывает фильтры,
+	// поэтому кэшированный путь берём лишь для «голого» запроса без фильтров;
+	// с любым фильтром идём в некэшируемый Room.Available.
+	var rooms []model.Room
+	if query.CapacityMin == nil && query.Floor == nil && len(query.Equipment) == 0 {
+		rooms, err = h.bookings.GetAvailableRooms(ctx, actor, start, end)
+	} else {
+		rooms, err = h.rooms.Available(ctx, actor, query)
+	}
 	if err != nil {
 		writeServiceError(w, err)
 		return

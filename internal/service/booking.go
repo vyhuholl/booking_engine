@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/example/booking-engine/internal/cache"
 	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
@@ -31,29 +32,35 @@ type BookingRepo interface {
 	ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
+// RoomLookup — доступ к комнатам, нужный сервису бронирования: точечный Get
+// (Create/Cancel) и поиск свободных комнат Available (GetAvailableRooms).
 type RoomLookup interface {
 	Get(ctx context.Context, id string) (model.Room, error)
+	Available(ctx context.Context, start, end string, capacityMin *int, floor *int, equipment []string) ([]model.Room, error)
 }
 
 type Booking struct {
 	rooms     RoomLookup
 	bookings  BookingRepo
+	cache     cache.RoomCacheInterface
 	publisher events.EventPublisher
 	topic     string
 	log       *slog.Logger
 	now       func() time.Time
 }
 
-// NewBooking собирает сервис бронирования. publisher может быть nil (тогда
-// события не публикуются — например, в окружении без Kafka); log == nil
-// заменяется на slog.Default().
-func NewBooking(rooms RoomLookup, bookings BookingRepo, publisher events.EventPublisher, topic string, log *slog.Logger) *Booking {
+// NewBooking собирает сервис бронирования. roomCache и publisher могут быть nil
+// (тогда, соответственно, кэш доступности отключён — всегда идём в БД — и события
+// не публикуются, например в окружении без Redis/Kafka); log == nil заменяется на
+// slog.Default().
+func NewBooking(rooms RoomLookup, bookings BookingRepo, roomCache cache.RoomCacheInterface, publisher events.EventPublisher, topic string, log *slog.Logger) *Booking {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Booking{
 		rooms:     rooms,
 		bookings:  bookings,
+		cache:     roomCache,
 		publisher: publisher,
 		topic:     topic,
 		log:       log,
@@ -125,6 +132,10 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		}
 	}
 
+	// Комната занята на новом интервале — список свободных комнат в затронутых
+	// окнах устарел, сбрасываем кэш доступности.
+	s.invalidateRoomCache(ctx, b.RoomID)
+
 	// Бронь зафиксирована — публикуем событие. Сбой публикации не откатывает
 	// операцию (eventual consistency), только логируется.
 	s.publishEvent(ctx, events.TypeBookingCreated, b)
@@ -161,9 +172,57 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 	}
 	b.Status = model.StatusCancelled
 
+	// Комната освободилась на интервале брони — сбрасываем кэш доступности.
+	s.invalidateRoomCache(ctx, b.RoomID)
+
 	// Бронь отменена в БД — публикуем событие (см. Create про eventual consistency).
 	s.publishEvent(ctx, events.TypeBookingCancelled, b)
 	return b, nil
+}
+
+// GetAvailableRooms возвращает комнаты без подтверждённых броней в окне
+// [start, end). Сначала пробуем кэш; при промахе идём в БД и кладём результат в
+// кэш. Кэш — оптимизация: любые его ошибки логируются, но не роняют запрос
+// (деградация к БД). При nil-кэше метод всегда обращается к БД.
+func (s *Booking) GetAvailableRooms(ctx context.Context, _ Actor, start, end time.Time) ([]model.Room, error) {
+	if !end.After(start) {
+		return nil, ErrInvalidTimeRange
+	}
+
+	if s.cache != nil {
+		switch rooms, err := s.cache.GetAvailableRooms(ctx, start, end); {
+		case err == nil:
+			return rooms, nil
+		case errors.Is(err, cache.ErrCacheMiss):
+			// промах — идём в БД
+		default:
+			s.log.Warn("room cache get", "err", err) // деградация к БД, запрос не роняем
+		}
+	}
+
+	rooms, err := s.rooms.Available(ctx, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.cache != nil {
+		if err := s.cache.SetAvailableRooms(ctx, start, end, rooms); err != nil {
+			s.log.Warn("room cache set", "err", err)
+		}
+	}
+	return rooms, nil
+}
+
+// invalidateRoomCache сбрасывает кэш доступности после изменения броней комнаты.
+// Кэш опционален и не критичен для корректности (TTL всё равно ограничивает
+// рассогласование): ошибка только логируется. No-op при nil-кэше.
+func (s *Booking) invalidateRoomCache(ctx context.Context, roomID string) {
+	if s.cache == nil {
+		return
+	}
+	if err := s.cache.InvalidateRoomCache(ctx, roomID); err != nil {
+		s.log.Error("invalidate room cache", "err", err, "room_id", roomID)
+	}
 }
 
 // publishEvent публикует событие о брони после успешной записи в БД.

@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/example/booking-engine/internal/cache"
 	"github.com/example/booking-engine/internal/events"
 	"github.com/example/booking-engine/internal/handler"
 	"github.com/example/booking-engine/internal/repository"
@@ -25,6 +27,7 @@ type config struct {
 	JWTSecret    string
 	KafkaBrokers []string
 	KafkaTopic   string
+	RedisURL     string
 }
 
 func loadConfig() (config, error) {
@@ -34,6 +37,7 @@ func loadConfig() (config, error) {
 		JWTSecret:    os.Getenv("JWT_SECRET"),
 		KafkaBrokers: splitAndTrim(os.Getenv("KAFKA_BROKERS")),
 		KafkaTopic:   getenv("KAFKA_TOPIC", "booking.events"),
+		RedisURL:     os.Getenv("REDIS_URL"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -92,6 +96,26 @@ func main() {
 	bookings := repository.NewBooking(pool)
 	users := repository.NewUser(pool)
 
+	// Кэш доступности комнат в Redis. Без REDIS_URL кэш не создаётся
+	// (roomCache == nil) — сервис всегда ходит в БД. Кэш опционален и
+	// деградируем: клиент подключается лениво, старт на него не завязан.
+	var roomCache cache.RoomCacheInterface
+	if cfg.RedisURL != "" {
+		opts, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			logger.Error("redis url", "err", err)
+			os.Exit(1)
+		}
+		rdb := redis.NewClient(opts)
+		defer func() {
+			if err := rdb.Close(); err != nil {
+				logger.Error("redis close", "err", err)
+			}
+		}()
+		roomCache = cache.NewRedis(rdb)
+		logger.Info("redis cache enabled", "addr", opts.Addr)
+	}
+
 	// Публикация событий в Kafka. Без KAFKA_BROKERS паблишер не создаётся
 	// (publisher == nil) — сервис просто не публикует события.
 	var publisher events.EventPublisher
@@ -107,7 +131,7 @@ func main() {
 	}
 
 	roomSvc := service.NewRoom(rooms, bookings)
-	bookingSvc := service.NewBooking(rooms, bookings, publisher, cfg.KafkaTopic, logger)
+	bookingSvc := service.NewBooking(rooms, bookings, roomCache, publisher, cfg.KafkaTopic, logger)
 	userSvc := service.NewUser(users)
 
 	h := handler.New(logger, cfg.JWTSecret, users, roomSvc, bookingSvc, userSvc)
