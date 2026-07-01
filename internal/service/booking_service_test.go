@@ -472,3 +472,443 @@ func conflictAt(start, end time.Time) func(context.Context, model.Booking) (*mod
 		}, nil
 	}
 }
+
+// --- Cancel / ListByUser fixtures ---------------------------------------
+
+const (
+	testBookingID = "b-1"
+	testOtherID   = "user-other"
+	testAdminID   = "admin-1"
+)
+
+// errAny — произвольная не-sentinel ошибка репозитория (для проверки проброса).
+var errAny = errors.New("unexpected repository failure")
+
+// testBooking — бронь с заданным владельцем, началом и статусом (длительность 1 час).
+func testBooking(owner string, start time.Time, status model.BookingStatus) model.Booking {
+	return model.Booking{
+		ID:        testBookingID,
+		RoomID:    testRoomID,
+		UserID:    owner,
+		Title:     "Standup",
+		StartTime: start,
+		EndTime:   start.Add(time.Hour),
+		Status:    status,
+	}
+}
+
+// bookingGet — repo.Get возвращает заданную бронь.
+func bookingGet(repo *mockBookingRepo, b model.Booking) {
+	repo.getFn = func(_ context.Context, _ string) (model.Booking, error) {
+		return b, nil
+	}
+}
+
+// cancelOK — repo.Cancel завершается успешно.
+func cancelOK(repo *mockBookingRepo) {
+	repo.cancelFn = func(_ context.Context, _ string) error { return nil }
+}
+
+// --- Cancel tests --------------------------------------------------------
+
+func TestBookingService_Cancel(t *testing.T) {
+	type testCase struct {
+		name           string
+		actor          Actor
+		bookingID      string
+		setupMocks     func(rooms *mockRoomLookup, repo *mockBookingRepo)
+		wantErrIs      error
+		wantHTTPStatus int
+		skipReason     string
+	}
+
+	cases := []testCase{
+		// --- Happy path / deadline boundary ---
+		{
+			name:      "TC-028 member cancels own booking 2h before start",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-029 cancel exactly 30 minutes before start (boundary)",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, fixedNow.Add(CancelDeadline), model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-030 cancel 29 minutes before start rejected",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, fixedNow.Add(29*time.Minute), model.StatusConfirmed))
+			},
+			wantErrIs:      ErrCancelTooLate,
+			wantHTTPStatus: http.StatusBadRequest,
+		},
+		{
+			name:      "TC-031 cancel after booking already started rejected",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, fixedNow.Add(-15*time.Minute), model.StatusConfirmed))
+			},
+			wantErrIs:      ErrCancelTooLate,
+			wantHTTPStatus: http.StatusBadRequest,
+		},
+		{
+			name:      "TC-032 30-minute boundary computed in UTC regardless of start's zone",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				// Абсолютный момент == now+30m, но хранится в не-UTC зоне.
+				msk := time.FixedZone("MSK", 3*60*60)
+				start := fixedNow.Add(CancelDeadline).In(msk)
+				bookingGet(repo, testBooking(testUserID, start, model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+
+		// --- Authorization ---
+		{
+			name:      "TC-033 member cannot cancel another user's booking",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+			},
+			wantErrIs:      ErrCancelForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:      "TC-034 manager cancels another user's booking on own floor",
+			actor:     testActor(model.RoleManager), // ManagesFloor == 2
+			bookingID: testBookingID,
+			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				roomFound(rooms, 2)
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-035 manager cannot cancel another user's booking on other floor",
+			actor:     testActor(model.RoleManager),
+			bookingID: testBookingID,
+			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				roomFound(rooms, 3)
+			},
+			wantErrIs:      ErrCancelForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:      "TC-036 manager cancels own booking on other floor (as owner)",
+			actor:     testActor(model.RoleManager),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				// Владелец — сам менеджер: room lookup не требуется.
+				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-037 manager cancels admin's booking on own floor",
+			actor:     testActor(model.RoleManager),
+			bookingID: testBookingID,
+			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testAdminID, baseStart, model.StatusConfirmed))
+				roomFound(rooms, 2)
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-038 admin cancels any booking on any floor",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "TC-039 admin still bound by 30-minute rule",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, fixedNow.Add(20*time.Minute), model.StatusConfirmed))
+			},
+			wantErrIs:      ErrCancelTooLate,
+			wantHTTPStatus: http.StatusBadRequest,
+		},
+
+		// --- Not found / already cancelled / auth ---
+		{
+			name:      "TC-040 cancel non-existent booking",
+			actor:     testActor(model.RoleMember),
+			bookingID: "ghost-999",
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				repo.getFn = func(_ context.Context, _ string) (model.Booking, error) {
+					return model.Booking{}, repository.ErrNotFound
+				}
+			},
+			wantErrIs:      ErrBookingNotFound,
+			wantHTTPStatus: http.StatusNotFound,
+		},
+		{
+			name:      "TC-041 cancel an already cancelled booking",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusCancelled))
+			},
+			wantErrIs:      ErrAlreadyCancelled,
+			wantHTTPStatus: http.StatusConflict,
+		},
+		{
+			name:           "TC-042 empty booking_id",
+			actor:          testActor(model.RoleMember),
+			bookingID:      "",
+			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
+			wantHTTPStatus: http.StatusBadRequest,
+			skipReason:     "booking_id is a chi path param; an empty id never routes to the service — enforced at handler/router",
+		},
+		{
+			name:           "TC-043 unauthenticated cancel request",
+			actor:          Actor{},
+			bookingID:      testBookingID,
+			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
+			wantHTTPStatus: http.StatusUnauthorized,
+			skipReason:     "authentication enforced at handler.authMiddleware, not service — covered by handler tests",
+		},
+
+		// --- New branch coverage (beyond the original CancelBooking table) ---
+		{
+			name:      "TC-044 manager without assigned floor cannot cancel another user's booking",
+			actor:     Actor{ID: testUserID, Role: model.RoleManager}, // ManagesFloor == nil
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+			},
+			wantErrIs:      ErrCancelForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:      "TC-045 manager denied when the booking's room lookup fails",
+			actor:     testActor(model.RoleManager),
+			bookingID: testBookingID,
+			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testOtherID, baseStart, model.StatusConfirmed))
+				rooms.getFn = func(_ context.Context, _ string) (model.Room, error) {
+					return model.Room{}, repository.ErrNotFound
+				}
+			},
+			wantErrIs:      ErrCancelForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:      "TC-046 race: booking cancelled between Get and Cancel",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				repo.cancelFn = func(_ context.Context, _ string) error {
+					return repository.ErrNotFound
+				}
+			},
+			wantErrIs:      ErrAlreadyCancelled,
+			wantHTTPStatus: http.StatusConflict,
+		},
+		{
+			name:      "TC-047 repository Get failure is propagated",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				repo.getFn = func(_ context.Context, _ string) (model.Booking, error) {
+					return model.Booking{}, errAny
+				}
+			},
+			wantErrIs:      errAny,
+			wantHTTPStatus: http.StatusInternalServerError,
+		},
+		{
+			name:      "TC-048 repository Cancel failure is propagated",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(testUserID, baseStart, model.StatusConfirmed))
+				repo.cancelFn = func(_ context.Context, _ string) error { return errAny }
+			},
+			wantErrIs:      errAny,
+			wantHTTPStatus: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skipReason != "" {
+				t.Skipf("skip (HTTP %d expected): %s", tc.wantHTTPStatus, tc.skipReason)
+			}
+
+			rooms := &mockRoomLookup{}
+			repo := &mockBookingRepo{}
+			tc.setupMocks(rooms, repo)
+
+			svc := newTestService(rooms, repo)
+			got, err := svc.Cancel(context.Background(), tc.actor, tc.bookingID)
+
+			if tc.wantErrIs != nil {
+				assert.ErrorIs(t, err, tc.wantErrIs, "expected sentinel error")
+				assert.Equal(t, model.Booking{}, got, "no booking returned on error")
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tc.bookingID, got.ID)
+			assert.Equal(t, model.StatusCancelled, got.Status, "booking marked cancelled")
+		})
+	}
+}
+
+// --- ListByUser tests ----------------------------------------------------
+
+func TestBookingService_ListByUser(t *testing.T) {
+	confirmed := model.StatusConfirmed
+	from := baseStart.Add(-24 * time.Hour)
+	to := baseStart.Add(24 * time.Hour)
+	sample := []model.Booking{testBooking(testUserID, baseStart, model.StatusConfirmed)}
+
+	type testCase struct {
+		name           string
+		actor          Actor
+		query          UserBookingsQuery
+		setupMocks     func(repo *mockBookingRepo)
+		wantErrIs      error
+		wantLen        int
+		wantFilter     *repository.UserBookingFilter
+		wantHTTPStatus int
+	}
+
+	listReturns := func(out []model.Booking) func(repo *mockBookingRepo) {
+		return func(repo *mockBookingRepo) {
+			repo.listByUserFn = func(_ context.Context, _ repository.UserBookingFilter) ([]model.Booking, error) {
+				return out, nil
+			}
+		}
+	}
+
+	cases := []testCase{
+		{
+			name:           "TC-049 member lists own bookings",
+			actor:          testActor(model.RoleMember),
+			query:          UserBookingsQuery{UserID: testUserID},
+			setupMocks:     listReturns(sample),
+			wantLen:        1,
+			wantHTTPStatus: http.StatusOK,
+		},
+		{
+			name:           "TC-050 member cannot list another user's bookings",
+			actor:          testActor(model.RoleMember),
+			query:          UserBookingsQuery{UserID: testOtherID},
+			setupMocks:     func(*mockBookingRepo) {},
+			wantErrIs:      ErrForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:           "TC-051 admin lists another user's bookings",
+			actor:          testActor(model.RoleAdmin),
+			query:          UserBookingsQuery{UserID: testOtherID},
+			setupMocks:     listReturns(sample),
+			wantLen:        1,
+			wantHTTPStatus: http.StatusOK,
+		},
+		{
+			name:           "TC-052 manager lists another user's bookings",
+			actor:          testActor(model.RoleManager),
+			query:          UserBookingsQuery{UserID: testOtherID},
+			setupMocks:     listReturns(nil),
+			wantLen:        0,
+			wantHTTPStatus: http.StatusOK,
+		},
+		{
+			name:           "TC-053 filters (status/from/to) forwarded to the repository",
+			actor:          testActor(model.RoleMember),
+			query:          UserBookingsQuery{UserID: testUserID, Status: &confirmed, From: &from, To: &to},
+			setupMocks:     listReturns(sample),
+			wantLen:        1,
+			wantFilter:     &repository.UserBookingFilter{UserID: testUserID, Status: &confirmed, From: &from, To: &to},
+			wantHTTPStatus: http.StatusOK,
+		},
+		{
+			name:  "TC-054 repository error is propagated",
+			actor: testActor(model.RoleMember),
+			query: UserBookingsQuery{UserID: testUserID},
+			setupMocks: func(repo *mockBookingRepo) {
+				repo.listByUserFn = func(_ context.Context, _ repository.UserBookingFilter) ([]model.Booking, error) {
+					return nil, errAny
+				}
+			},
+			wantErrIs:      errAny,
+			wantHTTPStatus: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &mockBookingRepo{}
+			tc.setupMocks(repo)
+
+			// Оборачиваем ListByUser, чтобы зафиксировать переданный фильтр.
+			var gotFilter repository.UserBookingFilter
+			if orig := repo.listByUserFn; orig != nil {
+				repo.listByUserFn = func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error) {
+					gotFilter = f
+					return orig(ctx, f)
+				}
+			}
+
+			svc := newTestService(&mockRoomLookup{}, repo)
+			got, err := svc.ListByUser(context.Background(), tc.actor, tc.query)
+
+			if tc.wantErrIs != nil {
+				assert.ErrorIs(t, err, tc.wantErrIs)
+				assert.Nil(t, got)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Len(t, got, tc.wantLen)
+			assert.Equal(t, tc.query.UserID, gotFilter.UserID, "user id forwarded to filter")
+			if tc.wantFilter != nil {
+				assert.Equal(t, *tc.wantFilter, gotFilter)
+			}
+		})
+	}
+}
+
+// --- Error type messages -------------------------------------------------
+
+func TestServiceErrorMessages(t *testing.T) {
+	t.Run("booking conflict error has a stable code", func(t *testing.T) {
+		err := &BookingConflictError{ConflictingID: "b-x", ConflictingStart: baseStart, ConflictingEnd: baseEnd}
+		assert.Equal(t, "booking_conflict", err.Error())
+	})
+	t.Run("validation error surfaces its message", func(t *testing.T) {
+		err := &ValidationError{Field: "title", Message: "title is required"}
+		assert.Equal(t, "title is required", err.Error())
+	})
+}

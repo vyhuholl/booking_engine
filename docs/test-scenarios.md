@@ -1,6 +1,9 @@
 # Тестовые сценарии: BookingService
 
-Источник истины для table-driven тестов в [`internal/service/booking_service_test.go`](../internal/service/booking_service_test.go).
+Источник истины для table-driven тестов в [`internal/service`](../internal/service):
+[`booking_service_test.go`](../internal/service/booking_service_test.go),
+[`room_service_test.go`](../internal/service/room_service_test.go),
+[`user_service_test.go`](../internal/service/user_service_test.go).
 
 ## Бизнес-правила
 
@@ -62,6 +65,73 @@
 | TC-041 | validation | Повторная отмена уже отменённой брони | booking.status=cancelled | 409 Conflict, "booking already cancelled" |
 | TC-042 | validation | Пустой booking_id | booking_id="" | 400 Bad Request, "booking_id is required" |
 | TC-043 | authorization | Неаутентифицированный запрос на отмену | без токена | 401 Unauthorized (проверяется на handler-слое) |
+| TC-044 | authorization | Manager без назначенного этажа (`ManagesFloor=nil`) отменяет чужую бронь | user=manager(floor=nil), owner=member | 403 Forbidden, `cancel_forbidden` |
+| TC-045 | edge case | Manager отменяет чужую бронь, но комната брони не найдена | user=manager(floor=2), owner=member, room lookup → not found | 403 Forbidden (без комнаты этаж не подтвердить) |
+| TC-046 | edge case | Гонка: бронь отменена между Get и Cancel | repo.Cancel → not found | 409 Conflict, `already_cancelled` |
+| TC-047 | infra | Репозиторий падает на Get брони | repo.Get → неожиданная ошибка | 500, ошибка пробрасывается без обёртки |
+| TC-048 | infra | Репозиторий падает на Cancel | repo.Cancel → неожиданная ошибка | 500, ошибка пробрасывается без обёртки |
+
+## BookingService.ListByUser
+
+Реализация — [`booking_service_test.go`](../internal/service/booking_service_test.go).
+
+| ID | Категория | Описание | Входные данные | Ожидаемый результат |
+|---|---|---|---|---|
+| TC-049 | happy path | Member смотрит свои брони | user=member, query.user=member | 200 OK, список броней |
+| TC-050 | authorization | Member смотрит чужие брони | user=member, query.user=other | 403 Forbidden, `forbidden` |
+| TC-051 | happy path | Admin смотрит чужие брони | user=admin, query.user=other | 200 OK |
+| TC-052 | happy path | Manager смотрит чужие брони | user=manager, query.user=other | 200 OK (пустой список допустим) |
+| TC-053 | happy path | Фильтры (status/from/to) пробрасываются в репозиторий | query с status+from+to | 200 OK, `UserBookingFilter` собран 1:1 |
+| TC-054 | infra | Репозиторий падает на выборке | repo.ListByUser → ошибка | 500, ошибка пробрасывается |
+
+## RoomService
+
+Реализация — [`room_service_test.go`](../internal/service/room_service_test.go). Правило: изменять комнаты (`Create`/`Update`/`Delete`) может только admin; чтение (`List`/`Get`/`Available`/`BookingsOnDate`) доступно любому актору.
+
+| ID | Категория | Описание | Входные данные | Ожидаемый результат |
+|---|---|---|---|---|
+| TC-055 | happy path | Admin создаёт валидную комнату | admin, name=" Aurora " (с пробелами), cap=8, floor=3 | 201 Created, id с префиксом `r-`, name обрезан, status=active |
+| TC-056 | authorization | Не-admin создаёт комнату | manager | 403 Forbidden, `forbidden` |
+| TC-057 | validation | Пустое имя | admin, name="   " | 400 Bad Request, `name is required` |
+| TC-058 | validation | Вместимость < 1 | admin, cap=0 | 400 Bad Request, `capacity must be >= 1` |
+| TC-059 | validation | Неизвестное оборудование | admin, equipment=["hologram"] | 400 Bad Request, `unknown equipment` |
+| TC-060 | edge case | Дубликаты оборудования схлопываются | equipment=[projector, projector, whiteboard] | 201 Created, equipment=[projector, whiteboard] |
+| TC-061 | infra | Репозиторий падает на Create | repo.Create → ошибка | 500, ошибка пробрасывается |
+| TC-062 | happy path | Admin обновляет name/capacity/floor/equipment | admin, все поля заданы, equipment с дублями | 200 OK, поля обновлены, equipment схлопнут |
+| TC-063 | authorization | Не-admin обновляет комнату | member | 403 Forbidden |
+| TC-064 | validation | Обновление несуществующей комнаты | admin, repo.Get → not found | 404 Not Found, `room_not_found` |
+| TC-065 | validation | Обновление в невалидную вместимость | admin, capacity=0 | 400 Bad Request (валидация после мержа полей) |
+| TC-066 | edge case | Комнату удалили между Get и Update | repo.Update → not found | 404 Not Found, `room_not_found` |
+| TC-067 | infra | Репозиторий падает на Update | repo.Update → ошибка | 500, ошибка пробрасывается |
+| TC-068 | happy path | Admin удаляет комнату без активных броней | admin, has_active=false | 204 No Content |
+| TC-069 | authorization | Не-admin удаляет комнату | manager | 403 Forbidden |
+| TC-070 | validation | Удаление несуществующей комнаты | admin, repo.Get → not found | 404 Not Found |
+| TC-071 | conflict | Удаление комнаты с активными бронями | admin, has_active=true | 409 Conflict, `room_has_active_bookings` |
+| TC-072 | infra | Проверка активных броней падает | admin, HasActiveForRoom → ошибка | 500, ошибка пробрасывается |
+| TC-073 | edge case | Комнату удалили между проверкой и Delete | repo.Delete → not found | 404 Not Found, `room_not_found` |
+| TC-074 | happy path | Поиск свободных комнат в валидном окне | start<end, equipment=[projector] | 200 OK; время нормализовано в UTC RFC3339, equipment проброшены строками |
+| TC-075 | validation | Окно, где end не позже start | start=11:00, end=10:00 | 400 Bad Request, `invalid_time_range` |
+| TC-076 | validation | `capacity_min` < 1 | capacity_min=0 | 400 Bad Request, `capacity_min must be >= 1` |
+| TC-077 | validation | Неизвестное оборудование в фильтре | equipment=["hologram"] | 400 Bad Request, `unknown equipment` |
+| TC-078 | infra | Репозиторий падает на Available | repo.Available → ошибка | 500, ошибка пробрасывается |
+| TC-079 | happy path | List пробрасывает фильтр и возвращает total | filter.limit=10 | 200 OK, список + total |
+| TC-080 | happy path | Get существующей комнаты | repo.Get → room | 200 OK |
+| TC-081 | validation | Get несуществующей комнаты | repo.Get → not found | 404 Not Found, `room_not_found` |
+| TC-082 | infra | Get пробрасывает неожиданную ошибку | repo.Get → ошибка | 500, ошибка пробрасывается |
+| TC-083 | happy path | BookingsOnDate для существующей комнаты | room есть; дата задана | 200 OK, брони за день |
+| TC-084 | validation | BookingsOnDate для несуществующей комнаты | repo.Get → not found | 404 Not Found, `room_not_found` |
+
+## UserService
+
+Реализация — [`user_service_test.go`](../internal/service/user_service_test.go).
+
+| ID | Категория | Описание | Входные данные | Ожидаемый результат |
+|---|---|---|---|---|
+| TC-085 | happy path | Существующий пользователь | repo.Get → user | 200 OK, пользователь возвращён |
+| TC-086 | validation | Несуществующий пользователь | repo.Get → not found | 404 Not Found, `user_not_found` |
+| TC-087 | infra | Репозиторий падает на Get | repo.Get → ошибка | 500, ошибка пробрасывается |
+| TC-088 | unit | `ActorFromUser` для manager | user{role=manager, floor=2} | Actor.IsManager()=true, ManagesFloor=2 |
+| TC-089 | unit | `ActorFromUser` для admin | user{role=admin} | Actor.IsAdmin()=true, ManagesFloor=nil |
 
 ## Ключевые решения, зафиксированные с PO
 
@@ -69,13 +139,18 @@
 - Manager может отменять бронь admin'а на своём этаже (правило #4 — по этажу, не по роли владельца).
 - Все темпоральные проверки (`в будущем`, `за 30 минут`) ведутся в общем UTC; входящие значения нормализуются из TZ клиента.
 - Формат `room_id` не валидируется на сервисе: любой нераспознанный ID превращается в 404 Not Found (поглощается TC-023). Отдельной 400-ошибки для «битого формата» нет — это сокращает дублирующую логику.
+- Отмена уже начавшейся/прошедшей брони (TC-031) возвращает тот же `cancel_too_late`, что и «за 29 минут»: отдельной ошибки для прошедшего времени нет — правило #3 выражено одним неравенством `start - now < 30m`.
+- `booking_id` для отмены приходит как path-параметр роутера (`chi.URLParam`), поэтому пустой ID до сервиса не доходит (TC-042) — по аналогии с аутентификацией это ответственность handler-слоя.
 - Мультитенантность вне скоупа сервиса — модели тенанта/организации в системе нет.
 
 ## Покрытие тестами
 
-Все сценарии из таблицы реализованы в [`booking_service_test.go`](../internal/service/booking_service_test.go), кроме одного:
+Все сценарии из таблиц реализованы в service-тестах, кроме перечисленных ниже — они относятся к handler/router-слою и в service-тестах помечены `t.Skip`:
 
 | ID | Где покрывается / статус |
 |---|---|
 | TC-026 (auth на Create) | Handler-слой: [`handler.authMiddleware`](../internal/handler/auth.go). В service-тестах помечен `t.Skip` с пояснением. |
+| TC-042 (пустой booking_id) | Router: `booking_id` — path-параметр, пустой ID не маршрутизируется до сервиса. |
 | TC-043 (auth на Cancel) | Аналогично — handler middleware. |
+
+Покрытие пакета `internal/service` по стейтментам — **98.7%** (`go test ./internal/service/ -cover`).
