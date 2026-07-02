@@ -29,6 +29,12 @@ type mockBookingRepo struct {
 	listByUserFn     func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
 	listByRoomFn     func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 	getByRangeFn     func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+
+	// Approval workflow (change add-large-room-approval). Методы, использующие
+	// эти поля, объявлены в approval_service_test.go — поля мока держим в одном
+	// месте, в определении структуры.
+	approveFn        func(ctx context.Context, id string, now time.Time) (model.Booking, error)
+	rejectAndOfferFn func(ctx context.Context, id, reason string, now time.Time) (model.Booking, *model.WaitlistEntry, error)
 }
 
 func (m *mockBookingRepo) Get(ctx context.Context, id string) (model.Booking, error) {
