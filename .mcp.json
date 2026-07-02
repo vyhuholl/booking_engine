@@ -19,6 +19,18 @@
         "./api"
       ],
       "env": {}
+    },
+    "openapi": {
+      "type": "stdio",
+      "command": "go",
+      "args": [
+        "run",
+        "-C",
+        "tools/mcp-openapi",
+        ".",
+        "../../api/openapi.yaml"
+      ],
+      "env": {}
     }
   }
 }
