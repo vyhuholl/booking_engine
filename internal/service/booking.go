@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -20,6 +21,10 @@ const (
 	MinBookingDuration = 15 * time.Minute
 	MaxBookingDuration = 8 * time.Hour
 	CancelDeadline     = 30 * time.Minute
+
+	// MaxTitleLength — предел длины заголовка брони в символах (рунах, не байтах),
+	// синхронизирован с maxLength в схеме BookingCreate (api/openapi.yaml).
+	MaxTitleLength = 200
 
 	// DaysPerWeek — размер окна недельного отчёта (WeeklyReport.Days).
 	DaysPerWeek = 7
@@ -108,8 +113,14 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 	// её логи (booking_id добавляется ниже, когда бронь получает id).
 	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "room_id", in.RoomID)
 
-	if strings.TrimSpace(in.Title) == "" {
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
 		return model.Booking{}, &ValidationError{Field: "title", Message: "title is required"}
+	}
+	// Длину считаем в рунах: заголовки на русском, len() в байтах отверг бы
+	// валидные строки короче лимита. Порог совпадает с maxLength в спеке.
+	if utf8.RuneCountInString(title) > MaxTitleLength {
+		return model.Booking{}, &ValidationError{Field: "title", Message: "title must be at most 200 characters"}
 	}
 	if strings.TrimSpace(in.RoomID) == "" {
 		return model.Booking{}, &ValidationError{Field: "room_id", Message: "room_id is required"}
@@ -134,7 +145,7 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		ID:        "b-" + uuid.NewString(),
 		RoomID:    in.RoomID,
 		UserID:    a.ID,
-		Title:     strings.TrimSpace(in.Title),
+		Title:     title,
 		StartTime: in.StartTime.UTC(),
 		EndTime:   in.EndTime.UTC(),
 		Status:    model.StatusConfirmed,

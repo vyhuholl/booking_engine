@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -454,6 +455,30 @@ func TestBookingService_Create(t *testing.T) {
 			actor: testActor(model.RoleMember),
 			input: BookingCreateInput{
 				RoomID: testRoomID, Title: "   ", StartTime: baseStart, EndTime: baseEnd,
+			},
+			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
+			wantErrAs:      new(*ValidationError),
+			wantHTTPStatus: http.StatusBadRequest,
+		},
+		{
+			// Кириллица: 200 рун = 400 байт. Проверяет, что предел считается в рунах
+			// (len() в байтах отверг бы валидный заголовок на границе).
+			name:  "TC-019a title exactly 200 runes (upper bound) ok",
+			actor: testActor(model.RoleMember),
+			input: BookingCreateInput{
+				RoomID: testRoomID, Title: strings.Repeat("ы", MaxTitleLength), StartTime: baseStart, EndTime: baseEnd,
+			},
+			setupMocks: func(rooms *mockRoomLookup, repo *mockBookingRepo) {
+				roomFound(rooms, 2)
+				noConflictInsert(repo)
+			},
+			wantHTTPStatus: http.StatusCreated,
+		},
+		{
+			name:  "TC-019b title 201 runes (above max) rejected",
+			actor: testActor(model.RoleMember),
+			input: BookingCreateInput{
+				RoomID: testRoomID, Title: strings.Repeat("ы", MaxTitleLength+1), StartTime: baseStart, EndTime: baseEnd,
 			},
 			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
 			wantErrAs:      new(*ValidationError),

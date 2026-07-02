@@ -446,7 +446,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Booking'
         '400':
-          description: Невалидные данные (неправильный интервал, нарушение лимитов)
+          description: Невалидные данные (неправильный интервал, нарушение лимитов, пустые или слишком длинные поля)
           content:
             application/json:
               schema:
@@ -467,6 +467,18 @@ paths:
                   value:
                     code: INVALID_TIME_RANGE
                     message: "end_time должен быть позже start_time"
+                startInPast:
+                  summary: Начало брони в прошлом
+                  value:
+                    code: START_IN_PAST
+                    message: "start_time должен быть в будущем"
+                validation:
+                  summary: Пустое или слишком длинное поле (room_id, title)
+                  value:
+                    code: VALIDATION_ERROR
+                    message: "title не должен превышать 200 символов"
+                    details:
+                      field: title
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -481,13 +493,14 @@ paths:
                     code: ROOM_NOT_FOUND
                     message: "Комната с id 'r-999' не найдена"
         '409':
-          description: Конфликт — комната уже занята в этом интервале
+          description: Конфликт — комната занята в этом интервале или выведена из обслуживания
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
-                default:
+                conflict:
+                  summary: Интервал уже занят другой бронью
                   value:
                     code: BOOKING_CONFLICT
                     message: "Комната уже забронирована в указанный интервал"
@@ -495,6 +508,13 @@ paths:
                       conflicting_booking_id: "b-87"
                       conflicting_start: "2026-05-19T10:30:00Z"
                       conflicting_end: "2026-05-19T11:30:00Z"
+                outOfService:
+                  summary: Комната выведена из обслуживания
+                  value:
+                    code: ROOM_OUT_OF_SERVICE
+                    message: "Комната недоступна для бронирования"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /bookings/{id}/cancel:
     parameters:
@@ -1271,3 +1291,14 @@ components:
               value:
                 code: NOT_FOUND
                 message: "Запрашиваемый ресурс не найден"
+    InternalError:
+      description: Внутренняя ошибка сервера
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            default:
+              value:
+                code: INTERNAL
+                message: "internal error"
