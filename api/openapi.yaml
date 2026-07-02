@@ -57,6 +57,14 @@ paths:
           schema:
             type: integer
             example: 3
+        - name: min_capacity
+          in: query
+          description: Минимальная вместимость
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            example: 4
         - name: limit
           in: query
           schema:
@@ -94,11 +102,13 @@ paths:
                         capacity: 10
                         floor: 3
                         equipment: [projector, whiteboard]
+                        status: active
                       - id: "r-002"
                         name: "Килиманджаро"
                         capacity: 6
                         floor: 3
                         equipment: [video_conf]
+                        status: active
                     total: 2
         '401':
           $ref: '#/components/responses/Unauthorized'
@@ -273,6 +283,7 @@ paths:
                       capacity: 10
                       floor: 3
                       equipment: [projector, whiteboard]
+                      status: active
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -934,9 +945,19 @@ components:
         - cancelled
       example: confirmed
 
+    RoomStatus:
+      type: string
+      description: |
+        Статус комнаты: `active` — доступна для бронирования;
+        `out_of_service` — выведена из обслуживания, бронировать нельзя.
+      enum:
+        - active
+        - out_of_service
+      example: active
+
     Room:
       type: object
-      required: [id, name, capacity, floor, equipment]
+      required: [id, name, capacity, floor, equipment, status]
       properties:
         id:
           type: string
@@ -956,6 +977,8 @@ components:
           items:
             $ref: '#/components/schemas/Equipment'
           example: [projector, whiteboard]
+        status:
+          $ref: '#/components/schemas/RoomStatus'
 
     RoomStats:
       type: object
