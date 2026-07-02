@@ -73,6 +73,7 @@ func (h *Handler) Router() http.Handler {
 			r.Put("/{id}", h.updateRoom)
 			r.Delete("/{id}", h.deleteRoom)
 			r.Get("/{id}/bookings", h.listRoomBookings)
+			r.Post("/{id}/availability", h.checkRoomAvailability)
 			r.Get("/{id}/stats", h.getRoomStats)
 			r.Post("/{id}/waitlist", h.joinWaitlist)
 			r.Get("/{id}/waitlist", h.listWaitlist)

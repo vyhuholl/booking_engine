@@ -381,6 +381,74 @@ func TestBooking_GetBookingsByDateRange(t *testing.T) {
 	})
 }
 
+func TestBooking_ListConflicting(t *testing.T) {
+	pool, cleanup := testutil.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	repo := repository.NewBooking(pool)
+	ctx := context.Background()
+	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	winStart := base.Add(11 * time.Hour) // 11:00
+	winEnd := base.Add(13 * time.Hour)   // 13:00
+
+	t.Run("returns confirmed overlaps ordered by start; boundary touches and other rooms excluded", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		otherRoom := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		// Соседние (встык, без пересечений между собой) брони комнаты.
+		lowerTouch := newBooking(roomID, userID, base.Add(10*time.Hour), time.Hour) // 10:00-11:00, касается нижней границы окна
+		inWindowA := newBooking(roomID, userID, base.Add(11*time.Hour), time.Hour)  // 11:00-12:00
+		inWindowB := newBooking(roomID, userID, base.Add(12*time.Hour), time.Hour)  // 12:00-13:00
+		upperTouch := newBooking(roomID, userID, base.Add(13*time.Hour), time.Hour) // 13:00-14:00, касается верхней границы окна
+		// Другая комната на том же интервале — не должна попасть.
+		otherRoomBk := newBooking(otherRoom, userID, base.Add(11*time.Hour), 2*time.Hour) // 11:00-13:00
+
+		for _, b := range []model.Booking{lowerTouch, inWindowA, inWindowB, upperTouch, otherRoomBk} {
+			conflict, err := repo.CreateChecked(ctx, b)
+			require.NoError(t, err)
+			require.Nil(t, conflict, "заполнение не должно давать конфликтов")
+		}
+
+		got, err := repo.ListConflicting(ctx, roomID, winStart, winEnd)
+		require.NoError(t, err)
+		require.Len(t, got, 2, "касания границей [11:00,13:00) не пересечение")
+		assert.Equal(t, inWindowA.ID, got[0].ID, "ordered by start_time ascending")
+		assert.Equal(t, inWindowB.ID, got[1].ID)
+	})
+
+	t.Run("cancelled bookings are excluded", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		b := newBooking(roomID, userID, base.Add(11*time.Hour), time.Hour) // 11:00-12:00
+		_, err := repo.CreateChecked(ctx, b)
+		require.NoError(t, err)
+		require.NoError(t, repo.Cancel(ctx, b.ID))
+
+		got, err := repo.ListConflicting(ctx, roomID, winStart, winEnd)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+		assert.NotNil(t, got, "пустой результат — непустой срез, не nil")
+	})
+
+	t.Run("room without overlapping bookings returns empty", func(t *testing.T) {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+
+		outside := newBooking(roomID, userID, base.Add(9*time.Hour), time.Hour) // 09:00-10:00, до окна
+		_, err := repo.CreateChecked(ctx, outside)
+		require.NoError(t, err)
+
+		got, err := repo.ListConflicting(ctx, roomID, winStart, winEnd)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+		assert.NotNil(t, got)
+	})
+}
+
 func TestBooking_Cancel(t *testing.T) {
 	pool, cleanup := testutil.SetupTestDB(t)
 	t.Cleanup(cleanup)

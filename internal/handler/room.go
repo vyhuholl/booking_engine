@@ -39,6 +39,16 @@ type roomStatsResponse struct {
 	BookingCount int       `json:"booking_count"`
 }
 
+type roomAvailabilityBody struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+}
+
+type roomAvailabilityResponse struct {
+	Available bool            `json:"available"`
+	Conflicts []model.Booking `json:"conflicts"`
+}
+
 func (h *Handler) listRooms(w http.ResponseWriter, r *http.Request) {
 	f := repository.RoomFilter{
 		Limit:  parseInt(r.URL.Query().Get("limit"), 50),
@@ -193,6 +203,26 @@ func (h *Handler) listRoomBookings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, bookings)
+}
+
+// checkRoomAvailability — POST /rooms/{id}/availability. Проверяет, свободна ли
+// комната на интервале [start_time, end_time), и возвращает пересекающиеся брони.
+func (h *Handler) checkRoomAvailability(w http.ResponseWriter, r *http.Request) {
+	var body roomAvailabilityBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "invalid JSON body", nil)
+		return
+	}
+	res, err := h.rooms.CheckAvailability(r.Context(), actorFromCtx(r.Context()),
+		chi.URLParam(r, "id"), body.StartTime, body.EndTime)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, roomAvailabilityResponse{
+		Available: res.Available,
+		Conflicts: res.Conflicts,
+	})
 }
 
 func (h *Handler) getRoomStats(w http.ResponseWriter, r *http.Request) {

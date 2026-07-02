@@ -115,6 +115,28 @@ func (r *Booking) CancelAndOfferWaitlist(ctx context.Context, id string, now tim
 	return b, offered, nil
 }
 
+// ListConflicting возвращает подтверждённые брони комнаты, пересекающие интервал
+// [start, end), отсортированные по времени начала. Тот же предикат пересечения, что
+// у IsRoomBusy/CreateChecked (полуоткрытые интервалы: касание границей не конфликт),
+// но с самими бронями — для проверки доступности комнаты. Пустой результат — не nil.
+func (r *Booking) ListConflicting(ctx context.Context, roomID string, start, end time.Time) ([]model.Booking, error) {
+	rows, err := r.pool.Query(ctx, `
+        SELECT id, room_id, user_id, title, start_time, end_time, status
+          FROM bookings
+         WHERE room_id    = $1
+           AND status     = 'confirmed'
+           AND start_time < $3
+           AND end_time   > $2
+         ORDER BY start_time`,
+		roomID, start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBookings(rows)
+}
+
 // IsRoomBusy сообщает, есть ли подтверждённая бронь комнаты, пересекающая интервал
 // [start, end). Используется листом ожидания: вставать в очередь можно только на
 // занятый интервал.

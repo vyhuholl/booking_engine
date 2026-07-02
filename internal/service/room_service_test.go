@@ -12,6 +12,7 @@ import (
 
 	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/repository"
+	"github.com/example/booking-engine/internal/testutil"
 )
 
 // --- Mocks ---------------------------------------------------------------
@@ -71,6 +72,7 @@ type mockBookingsForRoom struct {
 	hasActiveFn        func(ctx context.Context, roomID string, after time.Time) (bool, error)
 	listByRoomOnDateFn func(ctx context.Context, roomID string, date time.Time) ([]model.Booking, error)
 	countInPeriodFn    func(ctx context.Context, roomID string, from, to time.Time) (int, error)
+	listConflictingFn  func(ctx context.Context, roomID string, start, end time.Time) ([]model.Booking, error)
 }
 
 func (m *mockBookingsForRoom) HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error) {
@@ -92,6 +94,13 @@ func (m *mockBookingsForRoom) CountByRoomInPeriod(ctx context.Context, roomID st
 		panic("mockBookingsForRoom.CountByRoomInPeriod: not set up")
 	}
 	return m.countInPeriodFn(ctx, roomID, from, to)
+}
+
+func (m *mockBookingsForRoom) ListConflicting(ctx context.Context, roomID string, start, end time.Time) ([]model.Booking, error) {
+	if m.listConflictingFn == nil {
+		panic("mockBookingsForRoom.ListConflicting: not set up")
+	}
+	return m.listConflictingFn(ctx, roomID, start, end)
 }
 
 func newTestRoomService(rooms *mockRoomRepo, bookings *mockBookingsForRoom) *Room {
@@ -662,4 +671,129 @@ func TestRoomService_Stats(t *testing.T) {
 		_, err := svc.Stats(context.Background(), testActor(model.RoleMember), testRoomID)
 		assert.ErrorIs(t, err, errAny)
 	})
+}
+
+// --- CheckAvailability ---------------------------------------------------
+
+func TestRoomService_CheckAvailability(t *testing.T) {
+	activeRoom := func() (model.Room, error) { return testRoom(2), nil }
+	oosRoom := func() (model.Room, error) {
+		return testutil.Room(testutil.WithRoomStatus(model.RoomStatusOutOfService)), nil
+	}
+	conflict := testBooking(t, testUserID, baseStart, model.StatusConfirmed)
+
+	type testCase struct {
+		name          string
+		start, end    time.Time
+		roomGet       func() (model.Room, error)
+		conflicts     []model.Booking
+		conflictsErr  error
+		wantErrIs     error
+		wantErrAs     any
+		wantAvailable bool
+		wantConflicts int
+	}
+
+	cases := []testCase{
+		{
+			name:          "TC-088 active room without conflicts is available",
+			start:         baseStart,
+			end:           baseEnd,
+			roomGet:       activeRoom,
+			conflicts:     []model.Booking{},
+			wantAvailable: true,
+			wantConflicts: 0,
+		},
+		{
+			name:          "TC-089 active room with overlapping booking is unavailable",
+			start:         baseStart,
+			end:           baseEnd,
+			roomGet:       activeRoom,
+			conflicts:     []model.Booking{conflict},
+			wantAvailable: false,
+			wantConflicts: 1,
+		},
+		{
+			name:          "TC-090 out-of-service room is unavailable even without conflicts",
+			start:         baseStart,
+			end:           baseEnd,
+			roomGet:       oosRoom,
+			conflicts:     []model.Booking{},
+			wantAvailable: false,
+			wantConflicts: 0,
+		},
+		{
+			name:      "TC-091 missing room maps to ErrRoomNotFound",
+			start:     baseStart,
+			end:       baseEnd,
+			roomGet:   func() (model.Room, error) { return model.Room{}, repository.ErrNotFound },
+			wantErrIs: ErrRoomNotFound,
+		},
+		{
+			name:      "TC-092 end not after start rejected before hitting the repository",
+			start:     baseEnd,
+			end:       baseStart,
+			wantErrIs: ErrInvalidTimeRange,
+		},
+		{
+			name:      "TC-093 zero times rejected as validation error",
+			start:     time.Time{},
+			end:       time.Time{},
+			wantErrAs: new(*ValidationError),
+		},
+		{
+			name:         "TC-094 conflict lookup failure is propagated",
+			start:        baseStart,
+			end:          baseEnd,
+			roomGet:      activeRoom,
+			conflictsErr: errAny,
+			wantErrIs:    errAny,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			rooms := &mockRoomRepo{}
+			if tc.roomGet != nil {
+				rooms.getFn = func(_ context.Context, _ string) (model.Room, error) { return tc.roomGet() }
+			}
+
+			bookings := &mockBookingsForRoom{}
+			var gotRoomID string
+			var gotStart, gotEnd time.Time
+			if tc.roomGet != nil {
+				bookings.listConflictingFn = func(_ context.Context, roomID string, start, end time.Time) ([]model.Booking, error) {
+					gotRoomID, gotStart, gotEnd = roomID, start, end
+					return tc.conflicts, tc.conflictsErr
+				}
+			}
+
+			svc := newTestRoomService(rooms, bookings)
+			got, err := svc.CheckAvailability(context.Background(), testActor(model.RoleMember), testRoomID, tc.start, tc.end)
+
+			switch {
+			case tc.wantErrIs != nil:
+				assert.ErrorIs(t, err, tc.wantErrIs)
+				return
+			case tc.wantErrAs != nil:
+				assert.Error(t, err)
+				assert.True(t, errors.As(err, tc.wantErrAs),
+					"expected typed error %T, got %T (%v)", tc.wantErrAs, err, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantAvailable, got.Available)
+			assert.Len(t, got.Conflicts, tc.wantConflicts)
+			assert.NotNil(t, got.Conflicts, "conflicts должен быть непустым срезом, не nil")
+
+			// Интервал форвардится в репозиторий как есть по мгновению, но нормализованным к UTC.
+			assert.Equal(t, testRoomID, gotRoomID)
+			assert.True(t, gotStart.Equal(tc.start), "start передан тем же мгновением")
+			assert.True(t, gotEnd.Equal(tc.end), "end передан тем же мгновением")
+			assert.Equal(t, time.UTC, gotStart.Location(), "start нормализован к UTC")
+			assert.Equal(t, time.UTC, gotEnd.Location(), "end нормализован к UTC")
+		})
+	}
 }

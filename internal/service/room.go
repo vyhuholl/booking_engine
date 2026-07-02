@@ -25,6 +25,7 @@ type BookingsForRoom interface {
 	HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error)
 	ListByRoomOnDate(ctx context.Context, roomID string, date time.Time) ([]model.Booking, error)
 	CountByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) (int, error)
+	ListConflicting(ctx context.Context, roomID string, start, end time.Time) ([]model.Booking, error)
 }
 
 type Room struct {
@@ -161,6 +162,44 @@ func (s *Room) BookingsOnDate(ctx context.Context, _ Actor, roomID string, date 
 		return nil, err
 	}
 	return s.bookings.ListByRoomOnDate(ctx, roomID, date)
+}
+
+// RoomAvailability — результат проверки доступности комнаты на интервале.
+// Conflicts — подтверждённые брони, пересекающие интервал (пустой список, не nil).
+// Available истинно, только если комната активна И пересечений нет: комната вне
+// обслуживания недоступна для брони независимо от занятости (как в Booking.Create),
+// поэтому в этом случае Available=false даже при пустом Conflicts.
+type RoomAvailability struct {
+	Available bool
+	Conflicts []model.Booking
+}
+
+// CheckAvailability проверяет, свободна ли комната на интервале [start, end).
+// Доступно любому аутентифицированному пользователю (как BookingsOnDate/Stats) —
+// это read-проверка, а не создание брони, поэтому дедлайны и лимиты длительности
+// из validateInterval не применяются: проверяем лишь корректность самого интервала.
+func (s *Room) CheckAvailability(ctx context.Context, _ Actor, roomID string, start, end time.Time) (RoomAvailability, error) {
+	if start.IsZero() || end.IsZero() {
+		return RoomAvailability{}, &ValidationError{Field: "start_time", Message: "start_time and end_time are required"}
+	}
+	if !end.After(start) {
+		return RoomAvailability{}, ErrInvalidTimeRange
+	}
+
+	room, err := s.getOr404(ctx, roomID)
+	if err != nil {
+		return RoomAvailability{}, err
+	}
+
+	conflicts, err := s.bookings.ListConflicting(ctx, roomID, start.UTC(), end.UTC())
+	if err != nil {
+		return RoomAvailability{}, err
+	}
+
+	return RoomAvailability{
+		Available: room.Status == model.RoomStatusActive && len(conflicts) == 0,
+		Conflicts: conflicts,
+	}, nil
 }
 
 // RoomStats — статистика использования комнаты за период [PeriodStart, PeriodEnd).

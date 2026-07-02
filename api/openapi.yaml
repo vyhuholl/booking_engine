@@ -321,6 +321,62 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /rooms/{id}/availability:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    post:
+      tags: [Rooms]
+      summary: Проверить доступность комнаты на интервал
+      description: |
+        Проверяет, свободна ли комната на интервале `[start_time, end_time)`, и
+        возвращает пересекающиеся `confirmed` бронирования. `available` истинно, только
+        если комната активна **и** пересечений нет: комната вне обслуживания недоступна
+        для брони независимо от занятости. Доступно любому аутентифицированному
+        пользователю; лимиты длительности брони здесь не применяются.
+      operationId: checkRoomAvailability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomAvailabilityCheck'
+            examples:
+              default:
+                value:
+                  start_time: "2026-05-19T10:00:00Z"
+                  end_time: "2026-05-19T11:00:00Z"
+      responses:
+        '200':
+          description: Результат проверки доступности
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomAvailability'
+              examples:
+                available:
+                  summary: Комната свободна
+                  value:
+                    available: true
+                    conflicts: []
+                busy:
+                  summary: Комната занята
+                  value:
+                    available: false
+                    conflicts:
+                      - id: "b-87"
+                        room_id: "r-001"
+                        user_id: "u-42"
+                        title: "Sprint Planning"
+                        start_time: "2026-05-19T10:30:00Z"
+                        end_time: "2026-05-19T11:30:00Z"
+                        status: confirmed
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /rooms/{id}/stats:
     parameters:
       - $ref: '#/components/parameters/RoomId'
@@ -1033,6 +1089,35 @@ components:
           format: date-time
           description: Конец бронирования (RFC 3339, UTC). Длительность от 15 минут до 8 часов.
           example: "2026-05-19T11:00:00Z"
+
+    RoomAvailabilityCheck:
+      type: object
+      required: [start_time, end_time]
+      properties:
+        start_time:
+          type: string
+          format: date-time
+          description: Начало интервала (RFC 3339, UTC)
+          example: "2026-05-19T10:00:00Z"
+        end_time:
+          type: string
+          format: date-time
+          description: Конец интервала (RFC 3339, UTC), эксклюзивная граница
+          example: "2026-05-19T11:00:00Z"
+
+    RoomAvailability:
+      type: object
+      required: [available, conflicts]
+      properties:
+        available:
+          type: boolean
+          description: Комната свободна на интервале (активна и без пересечений).
+          example: true
+        conflicts:
+          type: array
+          description: Пересекающиеся confirmed бронирования (пустой список, если их нет).
+          items:
+            $ref: '#/components/schemas/Booking'
 
     WaitlistStatus:
       type: string
