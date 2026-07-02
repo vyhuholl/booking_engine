@@ -52,6 +52,14 @@ func (h *Handler) listRooms(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Floor = &n
 	}
+	if v := r.URL.Query().Get("min_capacity"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "min_capacity must be an integer", nil)
+			return
+		}
+		f.MinCapacity = &n
+	}
 	items, total, err := h.rooms.List(r.Context(), actorFromCtx(r.Context()), f)
 	if err != nil {
 		writeServiceError(w, err)

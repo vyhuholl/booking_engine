@@ -16,21 +16,29 @@ type Room struct {
 func NewRoom(pool *pgxpool.Pool) *Room { return &Room{pool: pool} }
 
 type RoomFilter struct {
-	Floor  *int
-	Limit  int
-	Offset int
+	Floor       *int
+	MinCapacity *int
+	Limit       int
+	Offset      int
 }
 
 func (r *Room) List(ctx context.Context, f RoomFilter) ([]model.Room, int, error) {
 	args := []any{}
-	where := ""
+	where := []string{"status = 'active'"}
+
 	if f.Floor != nil {
 		args = append(args, *f.Floor)
-		where = "WHERE floor = $1"
+		where = append(where, "floor = $"+itoa(len(args)))
+	}
+	if f.MinCapacity != nil {
+		args = append(args, *f.MinCapacity)
+		where = append(where, "capacity >= $"+itoa(len(args)))
 	}
 
+	whereClause := "WHERE " + join(where, " AND ")
+
 	var total int
-	if err := r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM rooms "+where, args...).Scan(&total); err != nil {
+	if err := r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM rooms "+whereClause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -39,8 +47,8 @@ func (r *Room) List(ctx context.Context, f RoomFilter) ([]model.Room, int, error
 		limit = 50
 	}
 	args = append(args, limit, f.Offset)
-	query := "SELECT id, name, capacity, floor, equipment, status FROM rooms " + where +
-		" ORDER BY floor, name LIMIT $" + itoa(len(args)-1) + " OFFSET $" + itoa(len(args))
+	query := "SELECT id, name, capacity, floor, equipment, status FROM rooms " + whereClause +
+		" ORDER BY name ASC LIMIT $" + itoa(len(args)-1) + " OFFSET $" + itoa(len(args))
 
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
