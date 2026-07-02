@@ -95,6 +95,7 @@ func main() {
 	rooms := repository.NewRoom(pool)
 	bookings := repository.NewBooking(pool)
 	users := repository.NewUser(pool)
+	waitlist := repository.NewWaitlist(pool)
 
 	// Кэш доступности комнат в Redis. Без REDIS_URL кэш не создаётся
 	// (roomCache == nil) — сервис всегда ходит в БД. Кэш опционален и
@@ -132,9 +133,10 @@ func main() {
 
 	roomSvc := service.NewRoom(rooms, bookings)
 	bookingSvc := service.NewBooking(rooms, bookings, roomCache, publisher, cfg.KafkaTopic, logger)
+	waitlistSvc := service.NewWaitlist(rooms, waitlist, bookings, roomCache, publisher, cfg.KafkaTopic, logger)
 	userSvc := service.NewUser(users)
 
-	h := handler.New(logger, cfg.JWTSecret, users, roomSvc, bookingSvc, userSvc)
+	h := handler.New(logger, cfg.JWTSecret, users, roomSvc, bookingSvc, waitlistSvc, userSvc)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

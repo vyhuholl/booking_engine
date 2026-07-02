@@ -37,6 +37,8 @@ tags:
     description: Управление переговорными комнатами
   - name: Bookings
     description: Управление бронированиями
+  - name: Waitlist
+    description: Лист ожидания на занятые интервалы комнат
   - name: Users
     description: Пользовательские операции
 
@@ -440,6 +442,10 @@ paths:
         - `admin` может отменять любое бронирование.
 
         Отмена возможна не позднее чем за 30 минут до `start_time`.
+
+        Побочный эффект: при отмене система в той же транзакции предлагает
+        освободившийся слот первой (по `position`) записи листа ожидания на
+        пересекающийся интервал — её статус меняется на `offered`.
       operationId: cancelBooking
       responses:
         '200':
@@ -490,6 +496,216 @@ paths:
                   value:
                     code: BOOKING_ALREADY_CANCELLED
                     message: "Бронирование уже отменено"
+
+  /rooms/{id}/waitlist:
+    parameters:
+      - $ref: '#/components/parameters/RoomId'
+    post:
+      tags: [Waitlist]
+      summary: Встать в очередь (лист ожидания)
+      description: |
+        Ставит пользователя в лист ожидания на интервал комнаты. Запись создаётся,
+        **только если комната занята** подтверждённой бронью в этом интервале; если
+        комната свободна — вернётся `409 WAITLIST_ROOM_AVAILABLE` (нужно оформить
+        обычную бронь). Интервал проходит те же проверки, что и обычное бронирование
+        (длительность 15 минут – 8 часов, начало в будущем). `position` назначается
+        автоматически и не редактируется.
+      operationId: joinWaitlist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WaitlistJoin'
+            examples:
+              default:
+                value:
+                  start_time: "2026-05-19T10:00:00Z"
+                  end_time: "2026-05-19T11:00:00Z"
+      responses:
+        '201':
+          description: Запись листа ожидания создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitlistEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Комната не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: ROOM_NOT_FOUND
+                    message: "Комната с id 'r-999' не найдена"
+        '409':
+          description: Нельзя встать в очередь
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                roomAvailable:
+                  summary: Комната свободна — нужна обычная бронь
+                  value:
+                    code: WAITLIST_ROOM_AVAILABLE
+                    message: "Комната свободна в указанный интервал; оформите бронь"
+                alreadyInWaitlist:
+                  summary: Уже в очереди на этот интервал
+                  value:
+                    code: ALREADY_IN_WAITLIST
+                    message: "У вас уже есть запись листа ожидания на этот интервал"
+                outOfService:
+                  summary: Комната вне обслуживания
+                  value:
+                    code: ROOM_OUT_OF_SERVICE
+                    message: "Комната недоступна для бронирования"
+    get:
+      tags: [Waitlist]
+      summary: Посмотреть очередь комнаты
+      description: Возвращает записи листа ожидания комнаты, отсортированные по `position`.
+      operationId: listWaitlist
+      responses:
+        '200':
+          description: Очередь комнаты
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WaitlistEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /waitlist/{id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/WaitlistId'
+    post:
+      tags: [Waitlist]
+      summary: Подтвердить предложенный слот
+      description: |
+        Подтверждает предложенный (`offered`) слот: создаёт обычное бронирование и
+        переводит запись в `converted`. Подтверждать может только владелец записи.
+        Таймаут проверяется здесь: если с момента предложения прошло больше 15 минут,
+        запись переходит в `expired`, слот предлагается следующему, а запрос вернёт
+        `409 OFFER_EXPIRED`.
+      operationId: confirmWaitlist
+      responses:
+        '201':
+          description: Слот подтверждён, создано бронирование
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Нельзя подтвердить — начало интервала уже наступило
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                startInPast:
+                  value:
+                    code: START_IN_PAST
+                    message: "start_time уже наступил — слот подтвердить нельзя"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Нельзя подтверждать чужую запись
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: WAITLIST_FORBIDDEN
+                    message: "Нельзя изменять чужую запись листа ожидания"
+        '404':
+          description: Запись листа ожидания не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: WAITLIST_NOT_FOUND
+                    message: "Запись листа ожидания не найдена"
+        '409':
+          description: Слот нельзя подтвердить
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                notPending:
+                  summary: Запись не в статусе offered
+                  value:
+                    code: OFFER_NOT_PENDING
+                    message: "Запись листа ожидания не в статусе offered"
+                expired:
+                  summary: Предложение протухло
+                  value:
+                    code: OFFER_EXPIRED
+                    message: "Срок подтверждения предложенного слота истёк"
+                conflict:
+                  summary: Интервал уже занят
+                  value:
+                    code: BOOKING_CONFLICT
+                    message: "Комната уже забронирована в указанный интервал"
+                outOfService:
+                  summary: Комната выведена из обслуживания
+                  value:
+                    code: ROOM_OUT_OF_SERVICE
+                    message: "Комната недоступна для бронирования"
+
+  /waitlist/{id}:
+    parameters:
+      - $ref: '#/components/parameters/WaitlistId'
+    delete:
+      tags: [Waitlist]
+      summary: Выйти из очереди
+      description: |
+        Удаляет запись листа ожидания. Удалять может владелец записи или `admin`.
+
+        Побочный эффект: если снимается запись в статусе `offered`, освободившийся слот
+        в той же транзакции предлагается следующей записи очереди (её статус → `offered`),
+        чтобы выход из очереди не «подвешивал» слот.
+      operationId: leaveWaitlist
+      responses:
+        '204':
+          description: Запись удалена
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Нельзя удалять чужую запись
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: WAITLIST_FORBIDDEN
+                    message: "Нельзя изменять чужую запись листа ожидания"
+        '404':
+          description: Запись листа ожидания не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: WAITLIST_NOT_FOUND
+                    message: "Запись листа ожидания не найдена"
 
   /users/{id}/bookings:
     parameters:
@@ -571,6 +787,14 @@ components:
       schema:
         type: string
         example: "b-100"
+    WaitlistId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор записи листа ожидания
+      schema:
+        type: string
+        example: "wl-100"
     UserId:
       name: id
       in: path
@@ -760,6 +984,73 @@ components:
           type: string
           format: date-time
           description: Конец бронирования (RFC 3339, UTC). Длительность от 15 минут до 8 часов.
+          example: "2026-05-19T11:00:00Z"
+
+    WaitlistStatus:
+      type: string
+      description: |
+        Статус записи листа ожидания:
+        `waiting` — в очереди; `offered` — слот предложен, ждёт подтверждения;
+        `expired` — предложение протухло; `converted` — подтверждено, создана бронь.
+      enum:
+        - waiting
+        - offered
+        - expired
+        - converted
+      example: waiting
+
+    WaitlistEntry:
+      type: object
+      required: [id, room_id, user_id, start_time, end_time, position, status, created_at]
+      properties:
+        id:
+          type: string
+          example: "wl-100"
+        room_id:
+          type: string
+          example: "r-001"
+        user_id:
+          type: string
+          example: "u-42"
+        start_time:
+          type: string
+          format: date-time
+          example: "2026-05-19T10:00:00Z"
+        end_time:
+          type: string
+          format: date-time
+          example: "2026-05-19T11:00:00Z"
+        position:
+          type: integer
+          minimum: 1
+          description: Порядковый номер в очереди комнаты (назначается автоматически)
+          example: 1
+        status:
+          $ref: '#/components/schemas/WaitlistStatus'
+        offered_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Момент предложения слота (заполнен только в статусе `offered`)
+          example: "2026-05-19T09:30:00Z"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-05-19T08:00:00Z"
+
+    WaitlistJoin:
+      type: object
+      required: [start_time, end_time]
+      properties:
+        start_time:
+          type: string
+          format: date-time
+          description: Начало интервала (RFC 3339, UTC)
+          example: "2026-05-19T10:00:00Z"
+        end_time:
+          type: string
+          format: date-time
+          description: Конец интервала (RFC 3339, UTC). Длительность от 15 минут до 8 часов.
           example: "2026-05-19T11:00:00Z"
 
     Error:

@@ -20,12 +20,14 @@ import (
 // --- Mocks ---------------------------------------------------------------
 
 type mockBookingRepo struct {
-	getFn           func(ctx context.Context, id string) (model.Booking, error)
-	createCheckedFn func(ctx context.Context, b model.Booking) (*model.Booking, error)
-	cancelFn        func(ctx context.Context, id string) error
-	listByUserFn    func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
-	listByRoomFn    func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
-	getByRangeFn    func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+	getFn            func(ctx context.Context, id string) (model.Booking, error)
+	createCheckedFn  func(ctx context.Context, b model.Booking) (*model.Booking, error)
+	cancelFn         func(ctx context.Context, id string) error
+	cancelAndOfferFn func(ctx context.Context, id string, now time.Time) (model.Booking, *model.WaitlistEntry, error)
+	isRoomBusyFn     func(ctx context.Context, roomID string, start, end time.Time) (bool, error)
+	listByUserFn     func(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
+	listByRoomFn     func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+	getByRangeFn     func(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 }
 
 func (m *mockBookingRepo) Get(ctx context.Context, id string) (model.Booking, error) {
@@ -47,6 +49,20 @@ func (m *mockBookingRepo) Cancel(ctx context.Context, id string) error {
 		panic("mockBookingRepo.Cancel: not set up")
 	}
 	return m.cancelFn(ctx, id)
+}
+
+func (m *mockBookingRepo) CancelAndOfferWaitlist(ctx context.Context, id string, now time.Time) (model.Booking, *model.WaitlistEntry, error) {
+	if m.cancelAndOfferFn == nil {
+		panic("mockBookingRepo.CancelAndOfferWaitlist: not set up")
+	}
+	return m.cancelAndOfferFn(ctx, id, now)
+}
+
+func (m *mockBookingRepo) IsRoomBusy(ctx context.Context, roomID string, start, end time.Time) (bool, error) {
+	if m.isRoomBusyFn == nil {
+		panic("mockBookingRepo.IsRoomBusy: not set up")
+	}
+	return m.isRoomBusyFn(ctx, roomID, start, end)
 }
 
 func (m *mockBookingRepo) ListByUser(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error) {
@@ -612,9 +628,18 @@ func bookingGet(repo *mockBookingRepo, b model.Booking) {
 	}
 }
 
-// cancelOK — repo.Cancel завершается успешно.
+// cancelOK — repo.CancelAndOfferWaitlist отменяет бронь успешно и никого не
+// предлагает из очереди (offered == nil). Возвращает ту же бронь, что отдаёт getFn
+// (её задаёт bookingGet до вызова), со статусом cancelled — как реальный репозиторий.
 func cancelOK(repo *mockBookingRepo) {
-	repo.cancelFn = func(_ context.Context, _ string) error { return nil }
+	repo.cancelAndOfferFn = func(ctx context.Context, id string, _ time.Time) (model.Booking, *model.WaitlistEntry, error) {
+		b, err := repo.getFn(ctx, id)
+		if err != nil {
+			return model.Booking{}, nil, err
+		}
+		b.Status = model.StatusCancelled
+		return b, nil, nil
+	}
 }
 
 // --- Cancel tests --------------------------------------------------------
@@ -832,8 +857,8 @@ func TestBookingService_Cancel(t *testing.T) {
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
 				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
-				repo.cancelFn = func(_ context.Context, _ string) error {
-					return repository.ErrNotFound
+				repo.cancelAndOfferFn = func(_ context.Context, _ string, _ time.Time) (model.Booking, *model.WaitlistEntry, error) {
+					return model.Booking{}, nil, repository.ErrNotFound
 				}
 			},
 			wantErrIs:      ErrAlreadyCancelled,
@@ -857,7 +882,9 @@ func TestBookingService_Cancel(t *testing.T) {
 			bookingID: testBookingID,
 			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
 				bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusConfirmed))
-				repo.cancelFn = func(_ context.Context, _ string) error { return errAny }
+				repo.cancelAndOfferFn = func(_ context.Context, _ string, _ time.Time) (model.Booking, *model.WaitlistEntry, error) {
+					return model.Booking{}, nil, errAny
+				}
 			},
 			wantErrIs:      errAny,
 			wantHTTPStatus: http.StatusInternalServerError,

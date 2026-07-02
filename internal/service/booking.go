@@ -29,9 +29,35 @@ type BookingRepo interface {
 	Get(ctx context.Context, id string) (model.Booking, error)
 	CreateChecked(ctx context.Context, b model.Booking) (*model.Booking, error)
 	Cancel(ctx context.Context, id string) error
+	CancelAndOfferWaitlist(ctx context.Context, id string, now time.Time) (model.Booking, *model.WaitlistEntry, error)
+	IsRoomBusy(ctx context.Context, roomID string, start, end time.Time) (bool, error)
 	ListByUser(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
 	ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 	GetBookingsByDateRange(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+}
+
+// validateInterval проверяет временной интервал брони или waitlist-записи по общим
+// правилам: обе границы заданы, end > start, start в будущем относительно now,
+// длительность в диапазоне [MinBookingDuration, MaxBookingDuration]. Разделяется
+// между Booking.Create и Waitlist.Join, чтобы правила и их ошибки не расходились.
+func validateInterval(now, start, end time.Time) error {
+	if start.IsZero() || end.IsZero() {
+		return &ValidationError{Field: "start_time", Message: "start_time and end_time are required"}
+	}
+	if !end.After(start) {
+		return ErrInvalidTimeRange
+	}
+	if !start.After(now) {
+		return ErrStartInPast
+	}
+	duration := end.Sub(start)
+	if duration < MinBookingDuration {
+		return ErrDurationTooShort
+	}
+	if duration > MaxBookingDuration {
+		return ErrDurationTooLong
+	}
+	return nil
 }
 
 // RoomLookup — доступ к комнатам, нужный сервису бронирования: точечный Get
@@ -88,21 +114,8 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 	if strings.TrimSpace(in.RoomID) == "" {
 		return model.Booking{}, &ValidationError{Field: "room_id", Message: "room_id is required"}
 	}
-	if in.StartTime.IsZero() || in.EndTime.IsZero() {
-		return model.Booking{}, &ValidationError{Field: "start_time", Message: "start_time and end_time are required"}
-	}
-	if !in.EndTime.After(in.StartTime) {
-		return model.Booking{}, ErrInvalidTimeRange
-	}
-	if !in.StartTime.After(s.now()) {
-		return model.Booking{}, ErrStartInPast
-	}
-	duration := in.EndTime.Sub(in.StartTime)
-	if duration < MinBookingDuration {
-		return model.Booking{}, ErrDurationTooShort
-	}
-	if duration > MaxBookingDuration {
-		return model.Booking{}, ErrDurationTooLong
+	if err := validateInterval(s.now(), in.StartTime, in.EndTime); err != nil {
+		return model.Booking{}, err
 	}
 
 	room, err := s.rooms.Get(ctx, in.RoomID)
@@ -179,7 +192,10 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 		return model.Booking{}, ErrCancelTooLate
 	}
 
-	if err := s.bookings.Cancel(ctx, id); err != nil {
+	// Отмена и предложение освободившегося слота листу ожидания — в одной
+	// транзакции, чтобы слот не был перехвачен между отменой и предложением.
+	cancelled, offered, err := s.bookings.CancelAndOfferWaitlist(ctx, id, s.now())
+	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			// гонка: уже отменили между Get и Cancel
 			return model.Booking{}, ErrAlreadyCancelled
@@ -187,9 +203,17 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 		log.Error("cancel booking: persist", slog.Any("error", err))
 		return model.Booking{}, err
 	}
-	b.Status = model.StatusCancelled
+	b = cancelled
 
 	log.Info("booking cancelled")
+
+	if offered != nil {
+		log.Info("waitlist slot offered",
+			"waitlist_id", offered.ID,
+			"offered_user_id", offered.UserID,
+			"position", offered.Position,
+		)
+	}
 
 	// Комната освободилась на интервале брони — сбрасываем кэш доступности.
 	s.invalidateRoomCache(ctx, log, b.RoomID)
@@ -240,12 +264,7 @@ func (s *Booking) GetAvailableRooms(ctx context.Context, _ Actor, start, end tim
 // рассогласование): ошибка — это деградация, на которой сервис выжил, поэтому
 // уровень Warn, а не Error. No-op при nil-кэше. log уже несёт контекст операции.
 func (s *Booking) invalidateRoomCache(ctx context.Context, log *slog.Logger, roomID string) {
-	if s.cache == nil {
-		return
-	}
-	if err := s.cache.InvalidateRoomCache(ctx, roomID); err != nil {
-		log.Warn("invalidate room cache", slog.Any("error", err))
-	}
+	invalidateRoomCache(ctx, s.cache, log, roomID)
 }
 
 // publishEvent публикует событие о брони после успешной записи в БД. Сбой
@@ -253,7 +272,24 @@ func (s *Booking) invalidateRoomCache(ctx context.Context, log *slog.Logger, roo
 // откатывать её из-за недоступной шины нельзя, поэтому уровень Warn. При
 // nil-паблишере метод — no-op. log уже несёт контекст операции.
 func (s *Booking) publishEvent(ctx context.Context, log *slog.Logger, eventType string, b model.Booking) {
-	if s.publisher == nil {
+	publishBookingEvent(ctx, s.publisher, s.topic, log, eventType, b, s.now())
+}
+
+// invalidateRoomCache — общий хелпер сброса кэша доступности комнаты (см. описание
+// у Booking.invalidateRoomCache). Разделяется сервисами Booking и Waitlist.
+func invalidateRoomCache(ctx context.Context, c cache.RoomCacheInterface, log *slog.Logger, roomID string) {
+	if c == nil {
+		return
+	}
+	if err := c.InvalidateRoomCache(ctx, roomID); err != nil {
+		log.Warn("invalidate room cache", slog.Any("error", err))
+	}
+}
+
+// publishBookingEvent — общий хелпер публикации события о брони (см. описание у
+// Booking.publishEvent). Разделяется сервисами Booking и Waitlist.
+func publishBookingEvent(ctx context.Context, p events.EventPublisher, topic string, log *slog.Logger, eventType string, b model.Booking, now time.Time) {
+	if p == nil {
 		return
 	}
 	ev := events.Event{
@@ -261,13 +297,13 @@ func (s *Booking) publishEvent(ctx context.Context, log *slog.Logger, eventType 
 		BookingID: b.ID,
 		UserID:    b.UserID,
 		RoomID:    b.RoomID,
-		Timestamp: s.now(),
+		Timestamp: now,
 	}
-	if err := s.publisher.Publish(ctx, s.topic, ev); err != nil {
+	if err := p.Publish(ctx, topic, ev); err != nil {
 		log.Warn("publish booking event, kafka unavailable",
 			slog.Any("error", err),
 			"type", eventType,
-			"topic", s.topic,
+			"topic", topic,
 		)
 	}
 }

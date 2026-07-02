@@ -21,6 +21,7 @@ type Handler struct {
 	users     UserLookup
 	rooms     *service.Room
 	bookings  *service.Booking
+	waitlist  *service.Waitlist
 	usersvc   *service.User
 }
 
@@ -34,6 +35,7 @@ func New(
 	users UserLookup,
 	rooms *service.Room,
 	bookings *service.Booking,
+	waitlist *service.Waitlist,
 	usersvc *service.User,
 ) *Handler {
 	return &Handler{
@@ -42,6 +44,7 @@ func New(
 		users:     users,
 		rooms:     rooms,
 		bookings:  bookings,
+		waitlist:  waitlist,
 		usersvc:   usersvc,
 	}
 }
@@ -71,11 +74,18 @@ func (h *Handler) Router() http.Handler {
 			r.Delete("/{id}", h.deleteRoom)
 			r.Get("/{id}/bookings", h.listRoomBookings)
 			r.Get("/{id}/stats", h.getRoomStats)
+			r.Post("/{id}/waitlist", h.joinWaitlist)
+			r.Get("/{id}/waitlist", h.listWaitlist)
 		})
 
 		r.Route("/bookings", func(r chi.Router) {
 			r.Post("/", h.createBooking)
 			r.Post("/{id}/cancel", h.cancelBooking)
+		})
+
+		r.Route("/waitlist", func(r chi.Router) {
+			r.Post("/{id}/confirm", h.confirmWaitlist)
+			r.Delete("/{id}", h.leaveWaitlist)
 		})
 
 		r.Get("/users/{id}/bookings", h.listUserBookings)

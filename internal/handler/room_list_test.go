@@ -58,7 +58,7 @@ func newRoomListHandler(rooms []model.Room, total int) *Handler {
 		"",
 		slog.Default(),
 	)
-	return New(slog.Default(), "secret", userLookupStub{}, roomSvc, bookingSvc, nil)
+	return New(slog.Default(), "secret", userLookupStub{}, roomSvc, bookingSvc, nil, nil)
 }
 
 // doRoomList вызывает хендлер listRooms напрямую с актором в контексте

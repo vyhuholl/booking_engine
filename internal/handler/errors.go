@@ -62,6 +62,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "CANCEL_FORBIDDEN",
 			"you are not allowed to cancel this booking", nil)
 		return
+	case errors.Is(err, service.ErrWaitlistForbidden):
+		writeError(w, http.StatusForbidden, "WAITLIST_FORBIDDEN",
+			"you are not allowed to modify this waitlist entry", nil)
+		return
 	}
 
 	// 404
@@ -74,6 +78,9 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, service.ErrUserNotFound):
 		writeError(w, http.StatusNotFound, "USER_NOT_FOUND", "user not found", nil)
+		return
+	case errors.Is(err, service.ErrWaitlistNotFound):
+		writeError(w, http.StatusNotFound, "WAITLIST_NOT_FOUND", "waitlist entry not found", nil)
 		return
 	}
 
@@ -105,6 +112,22 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, service.ErrRoomOutOfService):
 		writeError(w, http.StatusConflict, "ROOM_OUT_OF_SERVICE",
 			"room is not available for booking", nil)
+		return
+	case errors.Is(err, service.ErrRoomAvailable):
+		writeError(w, http.StatusConflict, "WAITLIST_ROOM_AVAILABLE",
+			"room is available in the requested interval; create a booking instead", nil)
+		return
+	case errors.Is(err, service.ErrAlreadyInWaitlist):
+		writeError(w, http.StatusConflict, "ALREADY_IN_WAITLIST",
+			"you already have a waitlist entry for this interval", nil)
+		return
+	case errors.Is(err, service.ErrOfferNotPending):
+		writeError(w, http.StatusConflict, "OFFER_NOT_PENDING",
+			"waitlist entry is not in offered state", nil)
+		return
+	case errors.Is(err, service.ErrOfferExpired):
+		writeError(w, http.StatusConflict, "OFFER_EXPIRED",
+			"the offered slot has expired", nil)
 		return
 	}
 

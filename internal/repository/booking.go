@@ -77,6 +77,59 @@ func (r *Booking) Cancel(ctx context.Context, id string) error {
 	return nil
 }
 
+// CancelAndOfferWaitlist атомарно (Serializable) отменяет бронь и предлагает
+// освободившийся слот первой (по position) waiting-записи листа ожидания на
+// пересекающийся интервал. Отмена и предложение — в одной транзакции: слот не может
+// быть перехвачен между отменой и предложением. Возвращает отменённую бронь и
+// опционально предложенную waitlist-запись (nil, если очереди на слот нет).
+// 0 отменённых строк → ErrNotFound (бронь не существует или уже отменена — гонка).
+func (r *Booking) CancelAndOfferWaitlist(ctx context.Context, id string, now time.Time) (model.Booking, *model.WaitlistEntry, error) {
+	var b model.Booking
+	var offered *model.WaitlistEntry
+	err := runSerializable(ctx, r.pool, func(tx pgx.Tx) error {
+		b = model.Booking{} // сброс перед каждой попыткой
+		offered = nil
+
+		scanErr := tx.QueryRow(ctx, `
+            UPDATE bookings SET status = 'cancelled'
+             WHERE id = $1 AND status = 'confirmed'
+            RETURNING id, room_id, user_id, title, start_time, end_time, status`, id,
+		).Scan(&b.ID, &b.RoomID, &b.UserID, &b.Title, &b.StartTime, &b.EndTime, &b.Status)
+		switch {
+		case scanErr == pgx.ErrNoRows:
+			return ErrNotFound
+		case scanErr != nil:
+			return scanErr
+		}
+
+		o, offerErr := offerNextSlot(ctx, tx, b.RoomID, b.StartTime, b.EndTime, now)
+		if offerErr != nil {
+			return offerErr
+		}
+		offered = o
+		return nil
+	})
+	if err != nil {
+		return model.Booking{}, nil, err
+	}
+	return b, offered, nil
+}
+
+// IsRoomBusy сообщает, есть ли подтверждённая бронь комнаты, пересекающая интервал
+// [start, end). Используется листом ожидания: вставать в очередь можно только на
+// занятый интервал.
+func (r *Booking) IsRoomBusy(ctx context.Context, roomID string, start, end time.Time) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM bookings
+             WHERE room_id = $1 AND status = 'confirmed'
+               AND start_time < $3 AND end_time > $2
+        )`, roomID, start, end,
+	).Scan(&exists)
+	return exists, err
+}
+
 type UserBookingFilter struct {
 	UserID string
 	Status *model.BookingStatus

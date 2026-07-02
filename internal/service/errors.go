@@ -20,6 +20,14 @@ var (
 	ErrCancelForbidden       = errors.New("cancel_forbidden")
 	ErrForbidden             = errors.New("forbidden")
 	ErrRoomHasActiveBookings = errors.New("room_has_active_bookings")
+
+	// Waitlist (лист ожидания).
+	ErrRoomAvailable     = errors.New("room_available")      // комната свободна — нужна обычная бронь, не очередь
+	ErrAlreadyInWaitlist = errors.New("already_in_waitlist") // уже есть активная запись на этот интервал
+	ErrWaitlistNotFound  = errors.New("waitlist_not_found")
+	ErrOfferNotPending   = errors.New("offer_not_pending") // запись не в статусе offered
+	ErrOfferExpired      = errors.New("offer_expired")     // прошло больше OfferTTL с момента предложения
+	ErrWaitlistForbidden = errors.New("waitlist_forbidden")
 )
 
 type BookingConflictError struct {

@@ -66,7 +66,7 @@ func newAvailabilityHandler(cachedRooms, filteredRooms []model.Room) *Handler {
 		}},
 		nil, "", nil,
 	)
-	return New(slog.Default(), "secret", userLookupStub{}, roomSvc, bookingSvc, nil)
+	return New(slog.Default(), "secret", userLookupStub{}, roomSvc, bookingSvc, nil, nil)
 }
 
 func windowQuery() url.Values {

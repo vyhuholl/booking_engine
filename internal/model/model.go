@@ -48,6 +48,25 @@ func (s RoomStatus) Valid() bool {
 	return false
 }
 
+// WaitlistStatus — жизненный цикл записи листа ожидания:
+// waiting → offered → (converted | expired).
+type WaitlistStatus string
+
+const (
+	WaitlistStatusWaiting   WaitlistStatus = "waiting"   // в очереди, ждёт освобождения слота
+	WaitlistStatusOffered   WaitlistStatus = "offered"   // слот предложен, ждёт подтверждения
+	WaitlistStatusExpired   WaitlistStatus = "expired"   // предложение протухло (не подтверждено за OfferTTL)
+	WaitlistStatusConverted WaitlistStatus = "converted" // подтверждено, создана обычная бронь
+)
+
+func (s WaitlistStatus) Valid() bool {
+	switch s {
+	case WaitlistStatusWaiting, WaitlistStatusOffered, WaitlistStatusExpired, WaitlistStatusConverted:
+		return true
+	}
+	return false
+}
+
 type Room struct {
 	ID        string      `json:"id"`
 	Name      string      `json:"name"`
@@ -73,6 +92,21 @@ type Booking struct {
 	StartTime time.Time     `json:"start_time"`
 	EndTime   time.Time     `json:"end_time"`
 	Status    BookingStatus `json:"status"`
+}
+
+// WaitlistEntry — запись листа ожидания на занятый интервал комнаты. Position —
+// автоназначаемый ординал в очереди комнаты (не редактируется клиентом). OfferedAt
+// заполняется при переходе в статус offered, иначе nil.
+type WaitlistEntry struct {
+	ID        string         `json:"id"`
+	RoomID    string         `json:"room_id"`
+	UserID    string         `json:"user_id"`
+	StartTime time.Time      `json:"start_time"`
+	EndTime   time.Time      `json:"end_time"`
+	Position  int            `json:"position"`
+	Status    WaitlistStatus `json:"status"`
+	OfferedAt *time.Time     `json:"offered_at,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 // BookingFilters — необязательные фильтры выборки броней. nil-поле означает
