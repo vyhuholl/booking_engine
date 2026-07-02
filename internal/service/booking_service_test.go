@@ -918,6 +918,194 @@ func TestBookingService_Cancel(t *testing.T) {
 	}
 }
 
+// --- ForceCancel tests ---------------------------------------------------
+
+// TestBookingService_ForceCancel покрывает принудительную отмену админом. Ключевые
+// отличия от Cancel: доступно только admin и дедлайн CancelDeadline не применяется
+// (можно отменить уже начавшуюся бронь). Общие ветки (not found / already cancelled /
+// гонка / проброс ошибок репозитория) проверяются так же, как в TestBookingService_Cancel.
+func TestBookingService_ForceCancel(t *testing.T) {
+	type testCase struct {
+		name           string
+		actor          Actor
+		bookingID      string
+		setupMocks     func(rooms *mockRoomLookup, repo *mockBookingRepo)
+		wantErrIs      error
+		wantHTTPStatus int
+	}
+
+	cases := []testCase{
+		// --- Happy path: admin, дедлайн игнорируется ---
+		{
+			name:      "admin force-cancels another user's booking 2h before start",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "admin force-cancels within the 30-minute deadline (bypassed)",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				// Обычный Cancel вернул бы ErrCancelTooLate (TC-030); force его игнорирует.
+				bookingGet(repo, testBooking(t, testOtherID, fixedNow.Add(20*time.Minute), model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+		{
+			name:      "admin force-cancels an already started booking (deadline bypassed)",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(t, testOtherID, fixedNow.Add(-15*time.Minute), model.StatusConfirmed))
+				cancelOK(repo)
+			},
+			wantHTTPStatus: http.StatusNoContent,
+		},
+
+		// --- Authorization: только admin ---
+		{
+			name:      "member cannot force-cancel even own booking",
+			actor:     testActor(model.RoleMember),
+			bookingID: testBookingID,
+			// getFn не задан: проверка прав идёт до похода в БД, репозиторий не трогается.
+			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
+			wantErrIs:      ErrForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+		{
+			name:           "manager cannot force-cancel even on own floor",
+			actor:          testActor(model.RoleManager), // ManagesFloor == 2
+			bookingID:      testBookingID,
+			setupMocks:     func(*mockRoomLookup, *mockBookingRepo) {},
+			wantErrIs:      ErrForbidden,
+			wantHTTPStatus: http.StatusForbidden,
+		},
+
+		// --- Not found / already cancelled / гонка / проброс ошибок ---
+		{
+			name:      "force-cancel non-existent booking",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: "ghost-999",
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				repo.getFn = func(_ context.Context, _ string) (model.Booking, error) {
+					return model.Booking{}, repository.ErrNotFound
+				}
+			},
+			wantErrIs:      ErrBookingNotFound,
+			wantHTTPStatus: http.StatusNotFound,
+		},
+		{
+			name:      "force-cancel an already cancelled booking",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusCancelled))
+			},
+			wantErrIs:      ErrAlreadyCancelled,
+			wantHTTPStatus: http.StatusConflict,
+		},
+		{
+			name:      "race: booking cancelled between Get and Cancel",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
+				repo.cancelAndOfferFn = func(_ context.Context, _ string, _ time.Time) (model.Booking, *model.WaitlistEntry, error) {
+					return model.Booking{}, nil, repository.ErrNotFound
+				}
+			},
+			wantErrIs:      ErrAlreadyCancelled,
+			wantHTTPStatus: http.StatusConflict,
+		},
+		{
+			name:      "repository Get failure is propagated",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				repo.getFn = func(_ context.Context, _ string) (model.Booking, error) {
+					return model.Booking{}, errAny
+				}
+			},
+			wantErrIs:      errAny,
+			wantHTTPStatus: http.StatusInternalServerError,
+		},
+		{
+			name:      "repository Cancel failure is propagated",
+			actor:     testActor(model.RoleAdmin),
+			bookingID: testBookingID,
+			setupMocks: func(_ *mockRoomLookup, repo *mockBookingRepo) {
+				bookingGet(repo, testBooking(t, testOtherID, baseStart, model.StatusConfirmed))
+				repo.cancelAndOfferFn = func(_ context.Context, _ string, _ time.Time) (model.Booking, *model.WaitlistEntry, error) {
+					return model.Booking{}, nil, errAny
+				}
+			},
+			wantErrIs:      errAny,
+			wantHTTPStatus: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			rooms := &mockRoomLookup{}
+			repo := &mockBookingRepo{}
+			tc.setupMocks(rooms, repo)
+
+			svc := newTestService(rooms, repo)
+			got, err := svc.ForceCancel(context.Background(), tc.actor, tc.bookingID)
+
+			if tc.wantErrIs != nil {
+				assert.ErrorIs(t, err, tc.wantErrIs, "expected sentinel error")
+				assert.Equal(t, model.Booking{}, got, "no booking returned on error")
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tc.bookingID, got.ID)
+			assert.Equal(t, model.StatusCancelled, got.Status, "booking marked cancelled")
+		})
+	}
+}
+
+// TestBookingService_ForceCancel_PublishesEvent: успешная принудительная отмена
+// публикует ровно одно событие booking.cancelled (тот же контракт, что у Cancel).
+func TestBookingService_ForceCancel_PublishesEvent(t *testing.T) {
+	repo := &mockBookingRepo{}
+	b := testBooking(t, testOtherID, baseStart, model.StatusConfirmed)
+	bookingGet(repo, b)
+	cancelOK(repo)
+
+	pub := &mockPublisher{}
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, repo, pub)
+
+	_, err := svc.ForceCancel(context.Background(), testActor(model.RoleAdmin), testBookingID)
+	assert.NoError(t, err)
+
+	calls := pub.calls()
+	assert.Len(t, calls, 1)
+	assert.Equal(t, events.TypeBookingCancelled, calls[0].event.Type)
+	assert.Equal(t, b.ID, calls[0].event.BookingID)
+}
+
+// TestBookingService_ForceCancel_NoEventOnForbidden: отклонённая по правам
+// принудительная отмена не публикует событие и не трогает репозиторий.
+func TestBookingService_ForceCancel_NoEventOnForbidden(t *testing.T) {
+	pub := &mockPublisher{}
+	// Ни репозиторий, ни кэш не заданы → любой их вызов паникует: проверяем,
+	// что не-админ отсекается до всякого обращения к ним.
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, &mockBookingRepo{}, pub)
+
+	_, err := svc.ForceCancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.ErrorIs(t, err, ErrForbidden)
+	assert.Empty(t, pub.calls(), "no event on forbidden force-cancel")
+}
+
 // --- Event publishing tests ---------------------------------------------
 
 // TestBookingService_Create_PublishesEvent: успешный Create публикует ровно

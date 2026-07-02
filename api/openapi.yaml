@@ -497,6 +497,54 @@ paths:
                     code: BOOKING_ALREADY_CANCELLED
                     message: "Бронирование уже отменено"
 
+  /bookings/{id}/force:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    delete:
+      tags: [Bookings]
+      summary: Принудительно отменить бронирование (admin)
+      description: |
+        Принудительная отмена бронирования администратором.
+
+        Отличия от обычной отмены (`POST /bookings/{id}/cancel`):
+        - Доступно **только роли `admin`** — не владельцу и не менеджеру этажа.
+        - Правило «не позднее чем за 30 минут до `start_time`» **не применяется**:
+          admin может отменить бронь в любой момент, в том числе уже начавшуюся.
+
+        Побочный эффект тот же, что у обычной отмены: в той же транзакции
+        освободившийся слот предлагается первой (по `position`) записи листа
+        ожидания на пересекающийся интервал — её статус меняется на `offered`.
+      operationId: forceCancelBooking
+      responses:
+        '204':
+          description: Бронирование принудительно отменено
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Принудительная отмена доступна только администратору
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: FORBIDDEN
+                    message: "operation not allowed for your role"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Бронирование уже отменено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                alreadyCancelled:
+                  value:
+                    code: BOOKING_ALREADY_CANCELLED
+                    message: "Бронирование уже отменено"
+
   /rooms/{id}/waitlist:
     parameters:
       - $ref: '#/components/parameters/RoomId'

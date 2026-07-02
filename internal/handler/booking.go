@@ -44,3 +44,14 @@ func (h *Handler) cancelBooking(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, booking)
 }
+
+// forceCancelBooking — DELETE /bookings/{id}/force. Принудительная отмена брони
+// администратором: в отличие от обычной отмены игнорирует 30-минутный дедлайн
+// (можно отменить даже уже начавшуюся бронь). Авторизация — в сервисе.
+func (h *Handler) forceCancelBooking(w http.ResponseWriter, r *http.Request) {
+	if _, err := h.bookings.ForceCancel(r.Context(), actorFromCtx(r.Context()), chi.URLParam(r, "id")); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

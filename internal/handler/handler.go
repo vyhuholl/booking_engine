@@ -81,6 +81,7 @@ func (h *Handler) Router() http.Handler {
 		r.Route("/bookings", func(r chi.Router) {
 			r.Post("/", h.createBooking)
 			r.Post("/{id}/cancel", h.cancelBooking)
+			r.Delete("/{id}/force", h.forceCancelBooking)
 		})
 
 		r.Route("/waitlist", func(r chi.Router) {

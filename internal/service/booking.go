@@ -223,6 +223,68 @@ func (s *Booking) Cancel(ctx context.Context, a Actor, id string) (model.Booking
 	return b, nil
 }
 
+// ForceCancel — принудительная отмена брони администратором. От обычного Cancel
+// отличается двумя правилами: (1) доступно только admin (не владельцу и не
+// менеджеру этажа); (2) не применяет дедлайн CancelDeadline — админ вправе отменить
+// бронь в любой момент, в том числе уже начавшуюся. Всё остальное идентично Cancel:
+// та же атомарная отмена с предложением слота листу ожидания, сброс кэша доступности
+// и публикация события booking.cancelled.
+func (s *Booking) ForceCancel(ctx context.Context, a Actor, id string) (model.Booking, error) {
+	// room_id добавляется ниже, когда бронь прочитана из БД.
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "booking_id", id)
+
+	// Права проверяем до похода в БД: правило чисто ролевое (не зависит от брони),
+	// поэтому не раскрываем существование чужой брони не-админу и не читаем зря.
+	if !a.IsAdmin() {
+		return model.Booking{}, ErrForbidden
+	}
+
+	b, err := s.bookings.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Booking{}, ErrBookingNotFound
+		}
+		log.Error("force cancel booking: lookup", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+	log = log.With("room_id", b.RoomID)
+
+	if b.Status == model.StatusCancelled {
+		return model.Booking{}, ErrAlreadyCancelled
+	}
+
+	// Дедлайн CancelDeadline намеренно НЕ проверяется — в этом и смысл принудительной
+	// отмены. Отмена и предложение освободившегося слота листу ожидания — в одной
+	// транзакции, чтобы слот не был перехвачен между отменой и предложением.
+	cancelled, offered, err := s.bookings.CancelAndOfferWaitlist(ctx, id, s.now())
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			// гонка: уже отменили между Get и Cancel
+			return model.Booking{}, ErrAlreadyCancelled
+		}
+		log.Error("force cancel booking: persist", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+	b = cancelled
+
+	log.Info("booking force-cancelled")
+
+	if offered != nil {
+		log.Info("waitlist slot offered",
+			"waitlist_id", offered.ID,
+			"offered_user_id", offered.UserID,
+			"position", offered.Position,
+		)
+	}
+
+	// Комната освободилась на интервале брони — сбрасываем кэш доступности.
+	s.invalidateRoomCache(ctx, log, b.RoomID)
+
+	// Бронь отменена в БД — публикуем событие (см. Create про eventual consistency).
+	s.publishEvent(ctx, log, events.TypeBookingCancelled, b)
+	return b, nil
+}
+
 // GetAvailableRooms возвращает комнаты без подтверждённых броней в окне
 // [start, end). Сначала пробуем кэш; при промахе идём в БД и кладём результат в
 // кэш. Кэш — оптимизация: любые его ошибки логируются, но не роняют запрос
