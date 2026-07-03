@@ -12,8 +12,10 @@ JWT-аутентификация. Комнаты, брони с проверко
 
 ## Структура
 
-- `cmd/server/` — точка входа: конфиг из env, wiring слоёв, graceful shutdown.
-- `cmd/devtoken/` — генератор dev-JWT: `JWT_SECRET=... go run ./cmd/devtoken <user_id>`.
+- `cmd/server/` — точка входа HTTP-сервера: конфиг из env, wiring слоёв, graceful shutdown.
+- `cmd/notifier/` — отдельный процесс-потребитель событий бронирования из Kafka, рассылает
+  уведомления пользователям через `Notifier` (по умолчанию `LogNotifier`). Запускается
+  независимо от HTTP-сервера, подключаясь к тем же БД и Kafka. См. `internal/notifications`.
 - `internal/handler/` — HTTP: роутинг, JSON, auth-middleware, маппинг ошибок.
 - `internal/service/` — бизнес-логика, валидация, авторизация.
 - `internal/repository/` — доступ к БД (SQL).

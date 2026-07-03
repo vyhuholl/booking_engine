@@ -24,3 +24,26 @@ func (r *User) Get(ctx context.Context, id string) (model.User, error) {
 	}
 	return u, nil
 }
+
+// ListAdmins возвращает всех пользователей с ролью admin. Используется
+// нотификатором для рассылки события booking.pending_approval всем админам.
+// Пустой список — не ошибка (админов может не быть).
+func (r *User) ListAdmins(ctx context.Context) ([]model.User, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, name, email, role, manages_floor FROM users WHERE role = 'admin' ORDER BY id`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var admins []model.User
+	for rows.Next() {
+		var u model.User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.ManagesFloor); err != nil {
+			return nil, err
+		}
+		admins = append(admins, u)
+	}
+	return admins, rows.Err()
+}

@@ -25,6 +25,10 @@ const (
 // Идентификаторы хранятся строками в формате всего проекта: b-<uuid>,
 // user-<uuid>, room-<uuid>.
 type Event struct {
+	// EventID — стабильный идентификатор события (формат evt-<uuid>). Ключ
+	// дедупликации у потребителей (см. internal/notifications): одно и то же
+	// событие при повторной доставке несёт тот же EventID.
+	EventID   string    `json:"event_id"`
 	Type      string    `json:"type"`
 	BookingID string    `json:"booking_id"`
 	UserID    string    `json:"user_id"`

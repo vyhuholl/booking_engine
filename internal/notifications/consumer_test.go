@@ -332,7 +332,8 @@ func newDispatcher(n Notifier, admins AdminLookup, dedup DedupStore, dl DeadLett
 }
 
 // runConsumer запускает Consumer в фоне на свежей consumer-group и глушит его в
-// t.Cleanup (отмена ctx + Close).
+// t.Cleanup (отмена ctx + Close). Даём небольшую паузу после старта, чтобы
+// консьюмер успел присоединиться к группе и начать чтение.
 func runConsumer(t *testing.T, brokers []string, topic string, disp *Dispatcher) {
 	t.Helper()
 	logger, _ := testutil.CaptureLogger()
@@ -344,6 +345,9 @@ func runConsumer(t *testing.T, brokers []string, topic string, disp *Dispatcher)
 		defer close(done)
 		_ = c.Run(ctx)
 	}()
+	// Пауза для consumer group coordination: консьюмер должен присоединиться к группе
+	// и получить назначение партиции от координатора.
+	time.Sleep(200 * time.Millisecond)
 	t.Cleanup(func() {
 		cancel()
 		<-done
@@ -363,29 +367,46 @@ func evt(eventID, typ, bookingID, userID string) events.Event {
 }
 
 // publish пишет события в топик по одному, ключ — BookingID (как продюсер), что
-// на односекционном топике сохраняет порядок публикации.
+// на односекционном топике сохраняет порядок публикации. Ретраит при UNKNOWN_TOPIC_OR_PARTITION,
+// так как metadata топика может ещё не успеть распространиться.
 func publish(t *testing.T, brokers []string, topic string, evs ...events.Event) {
 	t.Helper()
+	// Отключаем connection pool, чтобы избежать stale connections между тестами.
 	w := &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        topic,
-		Balancer:     &kafka.LeastBytes{},
-		BatchTimeout: 10 * time.Millisecond,
+		Addr:                   kafka.TCP(brokers...),
+		Topic:                  topic,
+		Balancer:               &kafka.LeastBytes{},
+		BatchTimeout:           10 * time.Millisecond,
+		AllowAutoTopicCreation: false, // мы создаём топик явно в newTopic
 	}
 	defer func() { _ = w.Close() }()
 
 	for _, ev := range evs {
 		payload, err := json.Marshal(ev)
 		require.NoError(t, err)
-		require.NoError(t, w.WriteMessages(context.Background(), kafka.Message{
-			Key:   []byte(ev.BookingID),
-			Value: payload,
-		}))
+		// Ретрай на случай, если metadata топика ещё не propagated к писателю.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for {
+			err := w.WriteMessages(ctx, kafka.Message{
+				Key:   []byte(ev.BookingID),
+				Value: payload,
+			})
+			if err == nil {
+				break
+			}
+			// UNKNOWN_TOPIC_OR_PARTITION (Error 3) → retry, metadata ещё не готов.
+			if kafkaErrorCode(err) == 3 {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			require.NoError(t, err)
+		}
 	}
 }
 
 // newTopic создаёт уникальный топик с одной партицией — детерминированный порядок
-// обработки для «барьерных» проверок.
+// обработки для «барьерных» проверок. Ждёт, пока топик станет доступен для записи.
 func newTopic(t *testing.T, brokers []string) string {
 	t.Helper()
 	topic := "booking.events." + uuid.NewString()
@@ -405,5 +426,49 @@ func newTopic(t *testing.T, brokers []string) string {
 		NumPartitions:     1,
 		ReplicationFactor: 1,
 	}))
-	return topic
+
+	// CreateTopics асинхронен: ждём, пока метаданные топика станут доступны и
+	// продюсер сможет писать. Проверяем попыткой записи тестового сообщения.
+	w := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:   brokers,
+		Topic:     topic,
+		BatchSize: 1,
+	})
+	defer w.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for topic %s to become writable", topic)
+		default:
+		}
+		err := w.WriteMessages(ctx, kafka.Message{
+			Key:   []byte("probe"),
+			Value: []byte("{}"),
+		})
+		if err == nil {
+			// Топик готов — тестовое сообщение записалось
+			return topic
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// kafkaErrorCode извлекает код ошибки из kafka.Error. Если ошибка не от Kafka — возвращает 0.
+func kafkaErrorCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	// kafka.Error это int, который удовлетворяет интерфейсу error
+	if kerr, ok := err.(kafka.Error); ok {
+		return int(kerr)
+	}
+	// Также проверяем обёрнутые ошибки
+	var kerr kafka.Error
+	if errors.As(err, &kerr) {
+		return int(kerr)
+	}
+	return 0
 }

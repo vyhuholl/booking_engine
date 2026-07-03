@@ -16,7 +16,7 @@ services:
       retries: 10
 
   kafka:
-    image: apache/kafka:3.9.0
+    image: apache/kafka:3.7.0
     ports:
       - "29092:29092" # доступ с хоста (внутри сети брокер — kafka:9092)
     environment:
@@ -28,6 +28,7 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       # Одноузловой dev-брокер: все фактор-репликации = 1.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -85,6 +86,26 @@ services:
       kafka:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  notifier:
+    build: .
+    command: ["./notifier"]
+    environment:
+      DATABASE_URL: postgres://booking:booking@postgres:5432/booking?sslmode=disable
+      JWT_SECRET: change-me-in-production
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: booking.events
+      KAFKA_GROUP_ID: notifier
+      NOTIFY_RETRY_MAX: "3"
+      NOTIFY_RETRY_BASE_SEC: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      kafka:
         condition: service_healthy
     restart: unless-stopped
 

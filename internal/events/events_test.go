@@ -15,6 +15,7 @@ import (
 // с потребителями топика.
 func TestEvent_JSONContract(t *testing.T) {
 	ev := events.Event{
+		EventID:   "evt-1",
 		Type:      events.TypeBookingCreated,
 		BookingID: "b-1",
 		UserID:    "user-1",
@@ -28,6 +29,7 @@ func TestEvent_JSONContract(t *testing.T) {
 	var got map[string]any
 	assert.NoError(t, json.Unmarshal(data, &got))
 	assert.Equal(t, map[string]any{
+		"event_id":   "evt-1",
 		"type":       "booking.created",
 		"booking_id": "b-1",
 		"user_id":    "user-1",

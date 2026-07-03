@@ -545,6 +545,7 @@ func publishBookingEvent(ctx context.Context, p events.EventPublisher, topic str
 		return
 	}
 	ev := events.Event{
+		EventID:   "evt-" + uuid.NewString(),
 		Type:      eventType,
 		BookingID: b.ID,
 		UserID:    b.UserID,

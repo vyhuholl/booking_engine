@@ -1164,6 +1164,8 @@ func TestBookingService_Create_PublishesEvent(t *testing.T) {
 	assert.Equal(t, actor.ID, ev.UserID)
 	assert.Equal(t, got.RoomID, ev.RoomID)
 	assert.True(t, ev.Timestamp.Equal(fixedNow), "timestamp taken from service clock")
+	assert.NotEmpty(t, ev.EventID, "event carries a dedup id")
+	assert.True(t, strings.HasPrefix(ev.EventID, "evt-"), "event id has evt- prefix: %s", ev.EventID)
 }
 
 // TestBookingService_Create_PublishFailureDoesNotFail: сбой публикации не
