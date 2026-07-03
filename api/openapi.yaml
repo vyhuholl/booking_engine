@@ -41,6 +41,8 @@ tags:
     description: Лист ожидания на занятые интервалы комнат
   - name: Users
     description: Пользовательские операции
+  - name: Approvals
+    description: Одобрение броней больших переговорок (admin)
 
 paths:
   /rooms:
@@ -423,7 +425,12 @@ paths:
         Создаёт бронирование комнаты. Сервер проверяет:
         - Существование комнаты.
         - Длительность от 15 минут до 8 часов.
-        - Отсутствие пересечений с другими `confirmed` бронированиями.
+        - Отсутствие пересечений с бронями, удерживающими слот
+          (`confirmed`, `pending_approval`, `approved`).
+
+        Комнаты вместимостью **больше 12 мест** требуют одобрения администратора:
+        бронь создаётся в статусе `pending_approval`, слот резервируется, а ответ —
+        **202 Accepted** (а не 201). Малые комнаты (≤ 12) — как прежде: 201 и `confirmed`.
       operationId: createBooking
       requestBody:
         required: true
@@ -440,11 +447,27 @@ paths:
                   end_time: "2026-05-19T11:00:00Z"
       responses:
         '201':
-          description: Бронирование создано
+          description: Бронирование создано (комната ≤ 12 мест, статус `confirmed`)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Booking'
+        '202':
+          description: |
+            Бронь большой переговорки (capacity > 12) принята на согласование —
+            статус `pending_approval`, ожидает решения администратора.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+              example:
+                id: "b-100"
+                room_id: "r-001"
+                user_id: "u-42"
+                title: "All-hands"
+                start_time: "2026-05-19T10:00:00Z"
+                end_time: "2026-05-19T11:00:00Z"
+                status: pending_approval
         '400':
           description: Невалидные данные (неправильный интервал, нарушение лимитов, пустые или слишком длинные поля)
           content:
@@ -631,6 +654,151 @@ paths:
                   value:
                     code: BOOKING_ALREADY_CANCELLED
                     message: "Бронирование уже отменено"
+
+  /admin/approvals:
+    get:
+      tags: [Approvals]
+      summary: Список броней, ожидающих одобрения (admin)
+      description: |
+        Возвращает брони в статусе `pending_approval`. Доступно **только роли `admin`**.
+
+        Побочный эффект: брони, пробывшие на согласовании дольше 24 часов, при обращении
+        лениво авто-отклоняются (переходят в `rejected`, публикуется `booking.rejected`) и
+        в список не попадают; их слоты освобождаются и предлагаются листу ожидания.
+      operationId: listApprovals
+      responses:
+        '200':
+          description: Список ожидающих одобрения броней (возможно пустой)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/approvals/{id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    post:
+      tags: [Approvals]
+      summary: Одобрить бронь (admin)
+      description: |
+        Переводит бронь из `pending_approval` в `approved` (слот остаётся занят).
+        Доступно **только `admin`**. Повторное одобрение (бронь уже не в
+        `pending_approval`) или бронь с истёкшим 24-часовым таймаутом →
+        `409 NOT_PENDING_APPROVAL` (просроченная при этом авто-отклоняется).
+      operationId: approveBooking
+      responses:
+        '200':
+          description: Бронь одобрена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Брони на согласовании с таким id нет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: APPROVAL_NOT_FOUND
+                    message: "pending approval not found"
+        '409':
+          description: Бронь не в статусе pending_approval (уже одобрена/отклонена/отменена/просрочена)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: NOT_PENDING_APPROVAL
+                    message: "booking is not pending approval"
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/approvals/{id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    post:
+      tags: [Approvals]
+      summary: Отклонить бронь с причиной (admin)
+      description: |
+        Переводит бронь из `pending_approval` в `rejected`, сохраняет причину и
+        освобождает слот, предлагая его первой (по `position`) записи листа ожидания на
+        пересекающийся интервал. Доступно **только `admin`**; `reason` обязателен.
+      operationId: rejectBooking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalReject'
+            examples:
+              default:
+                value:
+                  reason: "Комната зарезервирована под мероприятие"
+      responses:
+        '200':
+          description: Бронь отклонена (в ответе — поле `rejection_reason`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Пустая или отсутствующая причина
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: VALIDATION_ERROR
+                    message: "reason is required"
+                    details:
+                      field: reason
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Брони на согласовании с таким id нет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: APPROVAL_NOT_FOUND
+                    message: "pending approval not found"
+        '409':
+          description: Бронь не в статусе pending_approval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                default:
+                  value:
+                    code: NOT_PENDING_APPROVAL
+                    message: "booking is not pending approval"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /rooms/{id}/waitlist:
     parameters:
@@ -960,9 +1128,17 @@ components:
 
     BookingStatus:
       type: string
+      description: |
+        Статус брони. `pending_approval` — бронь большой переговорки (capacity > 12)
+        ожидает решения администратора; `approved` — одобрена администратором;
+        `rejected` — отклонена (админом или авто по 24-часовому таймауту).
+        Слот удерживают `confirmed`, `pending_approval`, `approved`.
       enum:
         - confirmed
         - cancelled
+        - pending_approval
+        - approved
+        - rejected
       example: confirmed
 
     RoomStatus:
@@ -1109,6 +1285,11 @@ components:
           example: "2026-05-19T11:00:00Z"
         status:
           $ref: '#/components/schemas/BookingStatus'
+        rejection_reason:
+          type: string
+          nullable: true
+          description: Причина отклонения — присутствует только для брони в статусе `rejected`.
+          example: "Комната зарезервирована под мероприятие"
 
     BookingCreate:
       type: object
@@ -1132,6 +1313,16 @@ components:
           format: date-time
           description: Конец бронирования (RFC 3339, UTC). Длительность от 15 минут до 8 часов.
           example: "2026-05-19T11:00:00Z"
+
+    ApprovalReject:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          description: Причина отклонения брони (непустая строка).
+          example: "Комната зарезервирована под мероприятие"
 
     RoomAvailabilityCheck:
       type: object

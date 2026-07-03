@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/example/booking-engine/internal/model"
 	"github.com/example/booking-engine/internal/service"
 )
 
@@ -33,7 +34,13 @@ func (h *Handler) createBooking(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, booking)
+	// Бронь большой переговорки создаётся на согласовании (pending_approval) —
+	// отвечаем 202 Accepted вместо 201 Created (change add-large-room-approval).
+	status := http.StatusCreated
+	if booking.Status == model.StatusPendingApproval {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, booking)
 }
 
 func (h *Handler) cancelBooking(w http.ResponseWriter, r *http.Request) {

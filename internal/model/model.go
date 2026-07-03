@@ -31,7 +31,34 @@ type BookingStatus string
 const (
 	StatusConfirmed BookingStatus = "confirmed"
 	StatusCancelled BookingStatus = "cancelled"
+
+	// Статусы workflow одобрения больших переговорок (change add-large-room-approval):
+	// бронь комнаты с capacity > 12 создаётся в pending_approval и удерживает слот,
+	// admin переводит её в approved (слот остаётся занят) или rejected (слот освобождается).
+	StatusPendingApproval BookingStatus = "pending_approval"
+	StatusApproved        BookingStatus = "approved"
+	StatusRejected        BookingStatus = "rejected"
 )
+
+// ActiveBookingStatuses — статусы, при которых бронь удерживает слот комнаты и
+// потому учитывается в проверке пересечений (занятости). rejected и cancelled слот
+// освобождают и сюда не входят. Единый источник правды для предикатов занятости в
+// repository (CreateChecked/IsRoomBusy/ListConflicting) — чтобы они не разошлись.
+var ActiveBookingStatuses = []BookingStatus{
+	StatusConfirmed,
+	StatusPendingApproval,
+	StatusApproved,
+}
+
+// IsActive сообщает, удерживает ли бронь в этом статусе слот комнаты.
+func (s BookingStatus) IsActive() bool {
+	for _, a := range ActiveBookingStatuses {
+		if s == a {
+			return true
+		}
+	}
+	return false
+}
 
 type RoomStatus string
 
@@ -92,6 +119,13 @@ type Booking struct {
 	StartTime time.Time     `json:"start_time"`
 	EndTime   time.Time     `json:"end_time"`
 	Status    BookingStatus `json:"status"`
+	// RejectionReason — причина отклонения (заполняется при reject/авто-reject
+	// брони на согласовании), nil для остальных статусов.
+	RejectionReason *string `json:"rejection_reason,omitempty"`
+	// CreatedAt — момент создания брони, якорь 24-часового таймаута одобрения
+	// (заполняется репозиторием из колонки created_at). Внутреннее поле — в JSON
+	// не отдаётся.
+	CreatedAt time.Time `json:"-"`
 }
 
 // WaitlistEntry — запись листа ожидания на занятый интервал комнаты. Position —

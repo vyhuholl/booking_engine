@@ -82,6 +82,9 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, service.ErrWaitlistNotFound):
 		writeError(w, http.StatusNotFound, "WAITLIST_NOT_FOUND", "waitlist entry not found", nil)
 		return
+	case errors.Is(err, service.ErrApprovalNotFound):
+		writeError(w, http.StatusNotFound, "APPROVAL_NOT_FOUND", "pending approval not found", nil)
+		return
 	}
 
 	// 409
@@ -128,6 +131,10 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, service.ErrOfferExpired):
 		writeError(w, http.StatusConflict, "OFFER_EXPIRED",
 			"the offered slot has expired", nil)
+		return
+	case errors.Is(err, service.ErrNotPendingApproval):
+		writeError(w, http.StatusConflict, "NOT_PENDING_APPROVAL",
+			"booking is not pending approval", nil)
 		return
 	}
 

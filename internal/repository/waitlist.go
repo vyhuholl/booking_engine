@@ -28,9 +28,10 @@ func scanWaitlistEntry(row pgx.Row) (model.WaitlistEntry, error) {
 }
 
 // Create в одной транзакции Serializable (с ретраями при сериализационных сбоях):
-//  1. проверяет, что комната ЗАНЯТА подтверждённой бронью на интервал — иначе
-//     ErrNoOverlap (запись в очередь не нужна); проверка атомарна с вставкой, поэтому
-//     параллельная отмена брони не создаёт запись на уже свободный слот;
+//  1. проверяет, что комната ЗАНЯТА активной бронью (activeStatusList: confirmed/
+//     pending_approval/approved) на интервал — иначе ErrNoOverlap (запись в очередь не
+//     нужна); проверка атомарна с вставкой, поэтому параллельная отмена брони не
+//     создаёт запись на уже свободный слот;
 //  2. вычисляет position (следующий номер среди активных записей комнаты);
 //  3. вставляет запись. Нарушение uq_waitlist_active нормализуется в ErrConflict.
 func (r *Waitlist) Create(ctx context.Context, e model.WaitlistEntry) (model.WaitlistEntry, error) {
@@ -39,7 +40,7 @@ func (r *Waitlist) Create(ctx context.Context, e model.WaitlistEntry) (model.Wai
 		if err := tx.QueryRow(ctx, `
             SELECT EXISTS (
                 SELECT 1 FROM bookings
-                 WHERE room_id = $1 AND status = 'confirmed'
+                 WHERE room_id = $1 AND status IN `+activeStatusList+`
                    AND start_time < $3 AND end_time > $2
             )`, e.RoomID, e.StartTime, e.EndTime,
 		).Scan(&busy); err != nil {
@@ -181,7 +182,7 @@ func (r *Waitlist) ConfirmAndBook(ctx context.Context, entryID string, b model.B
             SELECT id, room_id, user_id, title, start_time, end_time, status
               FROM bookings
              WHERE room_id   = $1
-               AND status    = 'confirmed'
+               AND status    IN `+activeStatusList+`
                AND start_time < $3
                AND end_time   > $2
              LIMIT 1`,

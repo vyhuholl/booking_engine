@@ -1,0 +1,4 @@
+-- PostgreSQL не поддерживает удаление значений enum (нет DROP VALUE), поэтому
+-- значения 'pending_approval'/'approved'/'rejected' откатить нельзя — они остаются
+-- в типе booking_status неиспользуемыми. Файл-заглушка для симметрии версий
+-- миграции: колонки и индекс снимаются в 005_booking_approval_columns.down.sql.

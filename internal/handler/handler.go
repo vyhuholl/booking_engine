@@ -90,6 +90,14 @@ func (h *Handler) Router() http.Handler {
 			r.Delete("/{id}", h.leaveWaitlist)
 		})
 
+		// Одобрение броней больших переговорок (change add-large-room-approval).
+		// Доступ admin-only проверяется в сервисе, не в роутере.
+		r.Route("/admin/approvals", func(r chi.Router) {
+			r.Get("/", h.listApprovals)
+			r.Post("/{id}/approve", h.approveBooking)
+			r.Post("/{id}/reject", h.rejectBooking)
+		})
+
 		r.Get("/users/{id}/bookings", h.listUserBookings)
 	})
 

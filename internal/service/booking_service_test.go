@@ -35,6 +35,7 @@ type mockBookingRepo struct {
 	// месте, в определении структуры.
 	approveFn        func(ctx context.Context, id string, now time.Time) (model.Booking, error)
 	rejectAndOfferFn func(ctx context.Context, id, reason string, now time.Time) (model.Booking, *model.WaitlistEntry, error)
+	listPendingFn    func(ctx context.Context, now time.Time, timeout time.Duration, reason string) ([]model.Booking, []model.Booking, error)
 }
 
 func (m *mockBookingRepo) Get(ctx context.Context, id string) (model.Booking, error) {

@@ -28,7 +28,19 @@ const (
 
 	// DaysPerWeek — размер окна недельного отчёта (WeeklyReport.Days).
 	DaysPerWeek = 7
+
+	// LargeRoomCapacityThreshold — комнаты вместимостью СТРОГО больше требуют
+	// одобрения администратора: бронь создаётся в статусе pending_approval
+	// (change add-large-room-approval).
+	LargeRoomCapacityThreshold = 12
+
+	// ApprovalTimeout — окно, в течение которого admin должен рассмотреть бронь на
+	// согласовании; по истечении она лениво авто-отклоняется (без cron, как OfferTTL).
+	ApprovalTimeout = 24 * time.Hour
 )
+
+// ApprovalTimeoutReason — причина, сохраняемая при авто-отклонении брони по таймауту.
+const ApprovalTimeoutReason = "approval timeout exceeded"
 
 type BookingRepo interface {
 	Get(ctx context.Context, id string) (model.Booking, error)
@@ -39,6 +51,11 @@ type BookingRepo interface {
 	ListByUser(ctx context.Context, f repository.UserBookingFilter) ([]model.Booking, error)
 	ListByRoomInPeriod(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
 	GetBookingsByDateRange(ctx context.Context, roomID string, from, to time.Time) ([]model.Booking, error)
+
+	// Approval workflow (change add-large-room-approval).
+	Approve(ctx context.Context, id string, now time.Time) (model.Booking, error)
+	RejectAndOfferWaitlist(ctx context.Context, id, reason string, now time.Time) (model.Booking, *model.WaitlistEntry, error)
+	ListPendingApprovals(ctx context.Context, now time.Time, timeout time.Duration, reason string) ([]model.Booking, []model.Booking, error)
 }
 
 // validateInterval проверяет временной интервал брони или waitlist-записи по общим
@@ -141,6 +158,17 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		return model.Booking{}, ErrRoomOutOfService
 	}
 
+	// Большие переговорки (capacity > порога) требуют одобрения администратора: бронь
+	// создаётся на согласовании и удерживает слот (см. предикат занятости репозитория),
+	// а событие — booking.pending_approval вместо booking.created. Малые комнаты — как
+	// прежде: сразу confirmed.
+	status := model.StatusConfirmed
+	eventType := events.TypeBookingCreated
+	if room.Capacity > LargeRoomCapacityThreshold {
+		status = model.StatusPendingApproval
+		eventType = events.TypeBookingPendingApproval
+	}
+
 	b := model.Booking{
 		ID:        "b-" + uuid.NewString(),
 		RoomID:    in.RoomID,
@@ -148,7 +176,7 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		Title:     title,
 		StartTime: in.StartTime.UTC(),
 		EndTime:   in.EndTime.UTC(),
-		Status:    model.StatusConfirmed,
+		Status:    status,
 	}
 	log = log.With("booking_id", b.ID)
 
@@ -165,7 +193,11 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 		}
 	}
 
-	log.Info("booking created")
+	if status == model.StatusPendingApproval {
+		log.Info("booking created, pending approval")
+	} else {
+		log.Info("booking created")
+	}
 
 	// Комната занята на новом интервале — список свободных комнат в затронутых
 	// окнах устарел, сбрасываем кэш доступности.
@@ -173,7 +205,7 @@ func (s *Booking) Create(ctx context.Context, a Actor, in BookingCreateInput) (m
 
 	// Бронь зафиксирована — публикуем событие. Сбой публикации не откатывает
 	// операцию (eventual consistency), только логируется.
-	s.publishEvent(ctx, log, events.TypeBookingCreated, b)
+	s.publishEvent(ctx, log, eventType, b)
 	return b, nil
 }
 
@@ -294,6 +326,153 @@ func (s *Booking) ForceCancel(ctx context.Context, a Actor, id string) (model.Bo
 	// Бронь отменена в БД — публикуем событие (см. Create про eventual consistency).
 	s.publishEvent(ctx, log, events.TypeBookingCancelled, b)
 	return b, nil
+}
+
+// ListPendingApprovals возвращает брони, ожидающие одобрения (только admin). Перед
+// выдачей лениво авто-отклоняет просроченные (старше ApprovalTimeout): их слоты
+// освобождаются и предлагаются очереди в репозитории, а сервис публикует для каждой
+// событие booking.rejected. Не-admin → ErrForbidden.
+func (s *Booking) ListPendingApprovals(ctx context.Context, a Actor) ([]model.Booking, error) {
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID)
+
+	if !a.IsAdmin() {
+		return nil, ErrForbidden
+	}
+
+	pending, autoRejected, err := s.bookings.ListPendingApprovals(ctx, s.now(), ApprovalTimeout, ApprovalTimeoutReason)
+	if err != nil {
+		log.Error("list pending approvals", slog.Any("error", err))
+		return nil, err
+	}
+
+	for _, b := range autoRejected {
+		blog := log.With("booking_id", b.ID, "room_id", b.RoomID)
+		blog.Info("booking auto-rejected on approval timeout")
+		// Слот освободился — сбрасываем кэш доступности и публикуем событие.
+		s.invalidateRoomCache(ctx, blog, b.RoomID)
+		publishBookingEvent(ctx, s.publisher, s.topic, blog, events.TypeBookingRejected, b, s.now())
+	}
+	return pending, nil
+}
+
+// Approve — одобрение брони большой комнаты администратором: переводит её из
+// pending_approval в approved (слот остаётся занят). Доступно только admin. Просроченную
+// (старше ApprovalTimeout) бронь одобрить нельзя — она лениво авто-отклоняется здесь же
+// (rejected, слот освобождается и предлагается очереди, событие booking.rejected), а
+// запрос получает ErrNotPendingApproval. Идемпотентность/гонка: повторное или
+// конкурентное одобрение не-pending брони → ErrNotPendingApproval.
+func (s *Booking) Approve(ctx context.Context, a Actor, id string) (model.Booking, error) {
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "booking_id", id)
+
+	// Права проверяем до БД: правило чисто ролевое (как ForceCancel), чужую бронь
+	// не-админу не раскрываем и зря в БД не ходим.
+	if !a.IsAdmin() {
+		return model.Booking{}, ErrForbidden
+	}
+
+	b, err := s.bookings.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Booking{}, ErrApprovalNotFound
+		}
+		log.Error("approve booking: lookup", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+	log = log.With("room_id", b.RoomID)
+
+	if b.Status != model.StatusPendingApproval {
+		return model.Booking{}, ErrNotPendingApproval
+	}
+
+	// Ленивый таймаут (воркера нет, протухание фиксируется при обращении). Просроченную
+	// бронь авто-отклоняем со своей причиной; одобрить её уже нельзя.
+	if s.now().Sub(b.CreatedAt) > ApprovalTimeout {
+		rejected, offered, rErr := s.bookings.RejectAndOfferWaitlist(ctx, id, ApprovalTimeoutReason, s.now())
+		if rErr != nil {
+			if errors.Is(rErr, repository.ErrNotFound) {
+				return model.Booking{}, ErrNotPendingApproval // гонка: уже не pending
+			}
+			log.Error("approve booking: auto-reject", slog.Any("error", rErr))
+			return model.Booking{}, rErr
+		}
+		log.Info("booking auto-rejected on approval timeout")
+		s.invalidateRoomCache(ctx, log, rejected.RoomID)
+		logOffered(log, offered)
+		s.publishEvent(ctx, log, events.TypeBookingRejected, rejected)
+		return model.Booking{}, ErrNotPendingApproval
+	}
+
+	approved, err := s.bookings.Approve(ctx, id, s.now())
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Booking{}, ErrNotPendingApproval // гонка: уже не pending
+		}
+		log.Error("approve booking: persist", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+
+	log.Info("booking approved")
+	// Кэш доступности не трогаем: слот и так был занят (pending_approval → approved).
+	s.publishEvent(ctx, log, events.TypeBookingApproved, approved)
+	return approved, nil
+}
+
+// Reject — отклонение брони большой комнаты администратором с указанием причины:
+// переводит её из pending_approval в rejected, сохраняет причину, освобождает слот и
+// предлагает его листу ожидания (как отмена). Доступно только admin; reason обязателен.
+// Идемпотентность/гонка: reject не-pending брони → ErrNotPendingApproval.
+func (s *Booking) Reject(ctx context.Context, a Actor, id, reason string) (model.Booking, error) {
+	log := s.log.With("trace_id", tracing.TraceID(ctx), "user_id", a.ID, "booking_id", id)
+
+	if !a.IsAdmin() {
+		return model.Booking{}, ErrForbidden
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return model.Booking{}, &ValidationError{Field: "reason", Message: "reason is required"}
+	}
+
+	b, err := s.bookings.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Booking{}, ErrApprovalNotFound
+		}
+		log.Error("reject booking: lookup", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+	log = log.With("room_id", b.RoomID)
+
+	if b.Status != model.StatusPendingApproval {
+		return model.Booking{}, ErrNotPendingApproval
+	}
+
+	rejected, offered, err := s.bookings.RejectAndOfferWaitlist(ctx, id, reason, s.now())
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Booking{}, ErrNotPendingApproval // гонка: уже не pending
+		}
+		log.Error("reject booking: persist", slog.Any("error", err))
+		return model.Booking{}, err
+	}
+
+	log.Info("booking rejected")
+	// Слот освободился — сбрасываем кэш доступности.
+	s.invalidateRoomCache(ctx, log, rejected.RoomID)
+	logOffered(log, offered)
+	s.publishEvent(ctx, log, events.TypeBookingRejected, rejected)
+	return rejected, nil
+}
+
+// logOffered логирует waitlist-запись, которой предложили освободившийся слот (nil —
+// no-op). Общий формат для reject и авто-reject по таймауту.
+func logOffered(log *slog.Logger, offered *model.WaitlistEntry) {
+	if offered != nil {
+		log.Info("waitlist slot offered",
+			"waitlist_id", offered.ID,
+			"offered_user_id", offered.UserID,
+			"position", offered.Position,
+		)
+	}
 }
 
 // GetAvailableRooms возвращает комнаты без подтверждённых броней в окне

@@ -166,6 +166,12 @@ func WithBookingStatus(s model.BookingStatus) BookingOption {
 	return func(b *model.Booking) { b.Status = s }
 }
 
+// WithCreatedAt задаёт момент создания брони — якорь 24-часового таймаута одобрения
+// (для интеграционных сидов; unit-фикстуры его не используют).
+func WithCreatedAt(at time.Time) BookingOption {
+	return func(b *model.Booking) { b.CreatedAt = at }
+}
+
 func WithTitle(title string) BookingOption {
 	return func(b *model.Booking) { b.Title = title }
 }

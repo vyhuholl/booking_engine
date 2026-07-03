@@ -58,6 +58,13 @@ func (m *mockBookingRepo) RejectAndOfferWaitlist(ctx context.Context, id, reason
 	return m.rejectAndOfferFn(ctx, id, reason, now)
 }
 
+func (m *mockBookingRepo) ListPendingApprovals(ctx context.Context, now time.Time, timeout time.Duration, reason string) ([]model.Booking, []model.Booking, error) {
+	if m.listPendingFn == nil {
+		panic("mockBookingRepo.ListPendingApprovals: not set up")
+	}
+	return m.listPendingFn(ctx, now, timeout, reason)
+}
+
 // --- Approval fixtures ----------------------------------------------------
 
 const testRejectReason = "комната зарезервирована под мероприятие"
@@ -633,4 +640,20 @@ func TestBookingService_Reject_PublishFailureDoesNotFail(t *testing.T) {
 	assert.NoError(t, err, "publish failure must not fail the rejection")
 	assert.Equal(t, model.StatusRejected, got.Status)
 	assert.Len(t, pub.calls(), 1, "publish was attempted")
+}
+
+// TestBookingService_Cancel_PendingApproval: бронь на согласовании можно отменить —
+// отмена владельцем имеет приоритет над одобрением (5.8). Cancel в сервисе статус-
+// агностичен (кроме «уже отменена»), а репозиторий расширил предикат отмены до
+// активных статусов (secция 2), поэтому pending_approval отменяется как обычная бронь.
+func TestBookingService_Cancel_PendingApproval(t *testing.T) {
+	repo := &mockBookingRepo{}
+	bookingGet(repo, testBooking(t, testUserID, baseStart, model.StatusPendingApproval))
+	cancelOK(repo)
+
+	svc := newTestServiceWithPublisher(&mockRoomLookup{}, repo, &mockPublisher{})
+
+	got, err := svc.Cancel(context.Background(), testActor(model.RoleMember), testBookingID)
+	assert.NoError(t, err)
+	assert.Equal(t, model.StatusCancelled, got.Status, "pending_approval booking cancels; cancel wins over approval")
 }

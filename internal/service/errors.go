@@ -28,6 +28,10 @@ var (
 	ErrOfferNotPending   = errors.New("offer_not_pending") // запись не в статусе offered
 	ErrOfferExpired      = errors.New("offer_expired")     // прошло больше OfferTTL с момента предложения
 	ErrWaitlistForbidden = errors.New("waitlist_forbidden")
+
+	// Approval workflow (одобрение больших переговорок, change add-large-room-approval).
+	ErrApprovalNotFound   = errors.New("approval_not_found")   // брони на согласовании с таким id нет
+	ErrNotPendingApproval = errors.New("not_pending_approval") // бронь не в статусе pending_approval (уже approved/rejected/cancelled/просрочена)
 )
 
 type BookingConflictError struct {

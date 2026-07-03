@@ -13,6 +13,12 @@ import (
 const (
 	TypeBookingCreated   = "booking.created"
 	TypeBookingCancelled = "booking.cancelled"
+
+	// Workflow одобрения больших переговорок (change add-large-room-approval):
+	// смена статуса брони публикуется отдельными событиями.
+	TypeBookingPendingApproval = "booking.pending_approval" // создана бронь на согласование
+	TypeBookingApproved        = "booking.approved"         // admin одобрил
+	TypeBookingRejected        = "booking.rejected"         // admin отклонил / авто-reject по таймауту
 )
 
 // Event — доменное событие бронирования, публикуемое в шину.

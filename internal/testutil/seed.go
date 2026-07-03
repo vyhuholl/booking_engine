@@ -3,6 +3,7 @@ package testutil
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,13 +49,19 @@ func SeedUser(t testing.TB, pool *pgxpool.Pool, opts ...UserOption) string {
 }
 
 // SeedBooking вставляет бронь напрямую (в обход repository.CreateChecked),
-// чтобы аранжировать состояние без проверки пересечений.
+// чтобы аранжировать состояние без проверки пересечений. created_at по умолчанию —
+// текущее время (как DEFAULT now()); задать явно (напр. просроченную pending_approval
+// бронь) можно через WithCreatedAt на фикстуре Booking.
 func SeedBooking(t testing.TB, pool *pgxpool.Pool, b model.Booking) {
 	t.Helper()
+	createdAt := b.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	_, err := pool.Exec(context.Background(),
-		`INSERT INTO bookings (id, room_id, user_id, title, start_time, end_time, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		b.ID, b.RoomID, b.UserID, b.Title, b.StartTime, b.EndTime, b.Status)
+		`INSERT INTO bookings (id, room_id, user_id, title, start_time, end_time, status, rejection_reason, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		b.ID, b.RoomID, b.UserID, b.Title, b.StartTime, b.EndTime, b.Status, b.RejectionReason, createdAt)
 	require.NoError(t, err)
 }
 
