@@ -266,6 +266,115 @@ func TestBooking_Approve_Concurrent(t *testing.T) {
 	assert.Equal(t, model.StatusApproved, got.Status)
 }
 
+// TestBooking_ApproveReject_Concurrent: при одновременных approve и reject одной
+// pending-брони ровно один успешен, второй получает ErrNotFound (0 строк условного
+// UPDATE) либо сериализационный сбой — гонка безопасна, двойного перехода не происходит.
+// Проверяет сценарий из спеки «Одобрение и отклонение конкурируют».
+func TestBooking_ApproveReject_Concurrent(t *testing.T) {
+	pool, cleanup := testutil.SetupTestDB(t)
+	t.Cleanup(cleanup)
+	repo := repository.NewBooking(pool)
+	ctx := context.Background()
+	base := time.Date(2030, 1, 1, 10, 0, 0, 0, time.UTC)
+	now := time.Now()
+	const reason = "конфликт бронирования"
+
+	// Запускаем approve и reject параллельно многократно
+	const iterations = 20
+	var successCount int
+	var bothSerialization int
+
+	for iter := 0; iter < iterations; iter++ {
+		cleanup()
+		roomID := seedRoom(t, pool)
+		userID := seedUser(t, pool)
+		b := seedBookingStatus(t, pool, roomID, userID, base, model.StatusPendingApproval, now)
+
+		var wg sync.WaitGroup
+		ready := make(chan struct{}, 2)
+		barrier := make(chan struct{})
+
+		type result struct {
+			status model.BookingStatus
+			err    error
+		}
+		var approveRes, rejectRes result
+
+		wg.Add(2)
+		// Approve goroutine
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-barrier
+			got, err := repo.Approve(ctx, b.ID, now)
+			approveRes = result{status: got.Status, err: err}
+		}()
+		// Reject goroutine
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-barrier
+			got, _, err := repo.RejectAndOfferWaitlist(ctx, b.ID, reason, now)
+			rejectRes = result{status: got.Status, err: err}
+		}()
+
+		// Синхронизация: ждём готовности обеих goroutine
+		<-ready
+		<-ready
+		close(barrier)
+		wg.Wait()
+
+		// Считаем успешные операции
+		iterSuccess := 0
+		if approveRes.err == nil && approveRes.status == model.StatusApproved {
+			iterSuccess++
+		}
+		if rejectRes.err == nil && rejectRes.status == model.StatusRejected {
+			iterSuccess++
+		}
+
+		// Проверяем serialization errors
+		approveSerial := isSerialization(approveRes.err)
+		rejectSerial := isSerialization(rejectRes.err)
+
+		if iterSuccess == 1 {
+			// Ровно одна операция успешна — корректно
+			successCount++
+			// Проигравшая сторона должна получить ErrNotFound или serialization
+			var loserErr error
+			if approveRes.err != nil {
+				loserErr = approveRes.err
+			} else {
+				loserErr = rejectRes.err
+			}
+			if loserErr != nil {
+				assert.True(t, errors.Is(loserErr, repository.ErrNotFound) || isSerialization(loserErr),
+					"losing operation must fail with ErrNotFound or serialization error, got: %v", loserErr)
+			}
+		} else if iterSuccess == 0 && approveSerial && rejectSerial {
+			// Обе serialization — тоже корректный исход гонки
+			bothSerialization++
+		} else {
+			// Некорректный исход
+			t.Fatalf("iteration %d: unexpected result - success=%d, approveErr=%v, rejectErr=%v",
+				iter, iterSuccess, approveRes.err, rejectRes.err)
+		}
+
+		// Проверяем финальный статус в БД (если была успешная операция)
+		if iterSuccess == 1 {
+			got, err := repo.Get(ctx, b.ID)
+			require.NoError(t, err)
+			assert.True(t, got.Status == model.StatusApproved || got.Status == model.StatusRejected,
+				"final status must be either approved or rejected, got: %s", got.Status)
+		}
+	}
+
+	// Хотя бы несколько итераций должны иметь успешный исход
+	assert.Greater(t, successCount, iterations/2,
+		"expected at least half of iterations to succeed, got %d of %d (both serialization: %d)",
+		successCount, iterations, bothSerialization)
+}
+
 // TestBooking_ListPendingApprovals: возвращает актуальные pending (по created_at),
 // а просроченные (created_at старше timeout) авто-отклоняет и освобождает их слот
 // листу ожидания.

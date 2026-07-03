@@ -105,20 +105,20 @@ func (r *Room) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// Available возвращает комнаты, у которых нет активных бронирований (activeStatusList:
+// Available возвращает комнаты, у которых нет активных бронирований (activeStatuses:
 // confirmed/pending_approval/approved), пересекающихся с интервалом [start, end), и
 // которые удовлетворяют фильтрам. Бронь на согласовании/одобренная делает комнату
 // недоступной так же, как подтверждённая.
 func (r *Room) Available(ctx context.Context, start, end string, capacityMin *int, floor *int, equipment []string) ([]model.Room, error) {
-	args := []any{start, end}
+	args := []any{start, end, activeStatuses}
 	where := []string{
-		`NOT EXISTS (
-            SELECT 1 FROM bookings b
-            WHERE b.room_id = r.id
-              AND b.status IN ` + activeStatusList + `
-              AND b.start_time < $2
-              AND b.end_time   > $1
-        )`,
+	`NOT EXISTS (
+	SELECT 1 FROM bookings b
+	WHERE b.room_id = r.id
+	AND b.status = ANY($3)
+	AND b.start_time < $2
+	AND b.end_time   > $1
+	)`,
 	}
 	if capacityMin != nil {
 		args = append(args, *capacityMin)

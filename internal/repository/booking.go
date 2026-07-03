@@ -21,19 +21,20 @@ func NewBooking(pool *pgxpool.Pool) *Booking { return &Booking{pool: pool} }
 // чтобы SELECT'ы и RETURNING не расходились со сканером.
 const bookingColumns = "id, room_id, user_id, title, start_time, end_time, status, rejection_reason, created_at"
 
-// activeStatusList — SQL-литерал IN-набора статусов, при которых бронь удерживает
-// слот комнаты и учитывается в проверке пересечений/занятости. Собран из
+// activeStatuses — список статусов, при которых бронь удерживает слот комнаты
+// и учитывается в проверке пересечений/занятости. Собран из
 // model.ActiveBookingStatuses — единого источника правды, чтобы предикаты занятости
-// в разных запросах не разошлись. Значения — константы enum (не пользовательский
-// ввод), поэтому их безопасно встраивать в SQL.
-var activeStatusList = buildStatusList(model.ActiveBookingStatuses)
+// в разных запросах не разошлись. Используется в SQL как параметр для ANY($N).
+var activeStatuses = buildStatusList(model.ActiveBookingStatuses)
 
-func buildStatusList(ss []model.BookingStatus) string {
-	quoted := make([]string, len(ss))
+// buildStatusList преобразует статусы модели в срез строк для использования в
+// SQL-запросах с ANY($N) (параметризованный запрос, без интерполяции).
+func buildStatusList(ss []model.BookingStatus) []string {
+	out := make([]string, len(ss))
 	for i, s := range ss {
-		quoted[i] = "'" + string(s) + "'"
+		out[i] = string(s)
 	}
-	return "(" + join(quoted, ", ") + ")"
+	return out
 }
 
 // scanBooking сканирует одну строку брони (все колонки в порядке bookingColumns).
@@ -54,7 +55,7 @@ func (r *Booking) Get(ctx context.Context, id string) (model.Booking, error) {
 }
 
 // CreateChecked атомарно проверяет отсутствие пересечений и вставляет бронирование.
-// Слот считается занятым любой активной бронью (activeStatusList: confirmed,
+// Слот считается занятым любой активной бронью (activeStatuses: confirmed,
 // pending_approval, approved) — pending_approval/approved резервируют интервал так же,
 // как confirmed. Если найден конфликт — возвращает его (*model.Booking, nil), иначе
 // (nil, nil).
@@ -66,14 +67,14 @@ func (r *Booking) CreateChecked(ctx context.Context, b model.Booking) (conflict 
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	c, scanErr := scanBooking(tx.QueryRow(ctx, `
-        SELECT `+bookingColumns+`
-          FROM bookings
-         WHERE room_id   = $1
-           AND status    IN `+activeStatusList+`
-           AND start_time < $3
-           AND end_time   > $2
-         LIMIT 1`,
-		b.RoomID, b.StartTime, b.EndTime,
+	SELECT `+bookingColumns+`
+	FROM bookings
+	WHERE room_id   = $1
+	AND status    = ANY($4)
+	AND start_time < $3
+	AND end_time   > $2
+	LIMIT 1`,
+	b.RoomID, b.StartTime, b.EndTime, activeStatuses,
 	))
 	switch {
 	case scanErr == nil:
@@ -94,7 +95,7 @@ func (r *Booking) CreateChecked(ctx context.Context, b model.Booking) (conflict 
 
 func (r *Booking) Cancel(ctx context.Context, id string) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE bookings SET status = 'cancelled' WHERE id = $1 AND status IN `+activeStatusList, id)
+		`UPDATE bookings SET status = 'cancelled' WHERE id = $1 AND status = ANY($2)`, id, activeStatuses)
 	if err != nil {
 		return err
 	}
@@ -106,7 +107,7 @@ func (r *Booking) Cancel(ctx context.Context, id string) error {
 
 // CancelAndOfferWaitlist атомарно (Serializable) отменяет бронь и предлагает
 // освободившийся слот первой (по position) waiting-записи листа ожидания на
-// пересекающийся интервал. Отменить можно любую активную бронь (activeStatusList —
+// пересекающийся интервал. Отменить можно любую активную бронь (activeStatuses —
 // в т.ч. pending_approval/approved: отмена владельцем имеет приоритет над одобрением).
 // Отмена и предложение — в одной транзакции: слот не может быть перехвачен между
 // отменой и предложением. Возвращает отменённую бронь и опционально предложенную
@@ -121,9 +122,9 @@ func (r *Booking) CancelAndOfferWaitlist(ctx context.Context, id string, now tim
 
 		var scanErr error
 		b, scanErr = scanBooking(tx.QueryRow(ctx, `
-            UPDATE bookings SET status = 'cancelled'
-             WHERE id = $1 AND status IN `+activeStatusList+`
-            RETURNING `+bookingColumns, id))
+		UPDATE bookings SET status = 'cancelled'
+		WHERE id = $1 AND status = ANY($2)
+		RETURNING `+bookingColumns+``, id, activeStatuses))
 		switch {
 		case errors.Is(scanErr, pgx.ErrNoRows):
 			return ErrNotFound
@@ -279,20 +280,20 @@ func (r *Booking) ListPendingApprovals(ctx context.Context, now time.Time, timeo
 	return pending, autoRejected, nil
 }
 
-// ListConflicting возвращает активные (activeStatusList) брони комнаты, пересекающие
+// ListConflicting возвращает активные (activeStatuses) брони комнаты, пересекающие
 // интервал [start, end), отсортированные по времени начала. Тот же предикат
 // пересечения, что у IsRoomBusy/CreateChecked (полуоткрытые интервалы: касание
 // границей не конфликт). Пустой результат — не nil.
 func (r *Booking) ListConflicting(ctx context.Context, roomID string, start, end time.Time) ([]model.Booking, error) {
 	rows, err := r.pool.Query(ctx, `
-        SELECT `+bookingColumns+`
-          FROM bookings
-         WHERE room_id    = $1
-           AND status     IN `+activeStatusList+`
-           AND start_time < $3
-           AND end_time   > $2
-         ORDER BY start_time`,
-		roomID, start, end,
+	SELECT `+bookingColumns+`
+	FROM bookings
+	WHERE room_id    = $1
+	AND status     = ANY($4)
+	AND start_time < $3
+	AND end_time   > $2
+	ORDER BY start_time`,
+	roomID, start, end, activeStatuses,
 	)
 	if err != nil {
 		return nil, err
@@ -301,18 +302,18 @@ func (r *Booking) ListConflicting(ctx context.Context, roomID string, start, end
 	return scanBookings(rows)
 }
 
-// IsRoomBusy сообщает, есть ли активная бронь комнаты (activeStatusList: confirmed,
+// IsRoomBusy сообщает, есть ли активная бронь комнаты (activeStatuses: confirmed,
 // pending_approval, approved), пересекающая интервал [start, end). Используется листом
 // ожидания: вставать в очередь можно только на занятый интервал — теперь занятость
 // создаёт и бронь на согласовании/одобренная, а не только подтверждённая.
 func (r *Booking) IsRoomBusy(ctx context.Context, roomID string, start, end time.Time) (bool, error) {
 	var exists bool
 	err := r.pool.QueryRow(ctx, `
-        SELECT EXISTS (
-            SELECT 1 FROM bookings
-             WHERE room_id = $1 AND status IN `+activeStatusList+`
-               AND start_time < $3 AND end_time > $2
-        )`, roomID, start, end,
+	SELECT EXISTS (
+	SELECT 1 FROM bookings
+	WHERE room_id = $1 AND status = ANY($4)
+	AND start_time < $3 AND end_time > $2
+	)`, roomID, start, end, activeStatuses,
 	).Scan(&exists)
 	return exists, err
 }
@@ -414,16 +415,16 @@ func (r *Booking) CountByRoomInPeriod(ctx context.Context, roomID string, from, 
 	return n, err
 }
 
-// HasActiveForRoom сообщает, есть ли у комнаты активная (activeStatusList) будущая
+// HasActiveForRoom сообщает, есть ли у комнаты активная (activeStatuses) будущая
 // бронь — используется как страховка перед удалением комнаты. Бронь на согласовании
 // (pending_approval) и одобренная (approved) тоже удерживают комнату, как confirmed.
 func (r *Booking) HasActiveForRoom(ctx context.Context, roomID string, after time.Time) (bool, error) {
 	var exists bool
 	err := r.pool.QueryRow(ctx, `
-        SELECT EXISTS (
-            SELECT 1 FROM bookings
-             WHERE room_id = $1 AND status IN `+activeStatusList+` AND end_time > $2
-        )`, roomID, after,
+	SELECT EXISTS (
+	SELECT 1 FROM bookings
+	WHERE room_id = $1 AND status = ANY($3) AND end_time > $2
+	)`, roomID, after, activeStatuses,
 	).Scan(&exists)
 	return exists, err
 }

@@ -28,7 +28,7 @@ func scanWaitlistEntry(row pgx.Row) (model.WaitlistEntry, error) {
 }
 
 // Create в одной транзакции Serializable (с ретраями при сериализационных сбоях):
-//  1. проверяет, что комната ЗАНЯТА активной бронью (activeStatusList: confirmed/
+//  1. проверяет, что комната ЗАНЯТА активной бронью (activeStatuses: confirmed/
 //     pending_approval/approved) на интервал — иначе ErrNoOverlap (запись в очередь не
 //     нужна); проверка атомарна с вставкой, поэтому параллельная отмена брони не
 //     создаёт запись на уже свободный слот;
@@ -38,11 +38,11 @@ func (r *Waitlist) Create(ctx context.Context, e model.WaitlistEntry) (model.Wai
 	err := runSerializable(ctx, r.pool, func(tx pgx.Tx) error {
 		var busy bool
 		if err := tx.QueryRow(ctx, `
-            SELECT EXISTS (
-                SELECT 1 FROM bookings
-                 WHERE room_id = $1 AND status IN `+activeStatusList+`
-                   AND start_time < $3 AND end_time > $2
-            )`, e.RoomID, e.StartTime, e.EndTime,
+		SELECT EXISTS (
+		SELECT 1 FROM bookings
+		WHERE room_id = $1 AND status = ANY($4)
+		AND start_time < $3 AND end_time > $2
+		)`, e.RoomID, e.StartTime, e.EndTime, activeStatuses,
 		).Scan(&busy); err != nil {
 			return err
 		}
@@ -179,14 +179,14 @@ func (r *Waitlist) ConfirmAndBook(ctx context.Context, entryID string, b model.B
 
 		var c model.Booking
 		scanErr := tx.QueryRow(ctx, `
-            SELECT id, room_id, user_id, title, start_time, end_time, status
-              FROM bookings
-             WHERE room_id   = $1
-               AND status    IN `+activeStatusList+`
-               AND start_time < $3
-               AND end_time   > $2
-             LIMIT 1`,
-			b.RoomID, b.StartTime, b.EndTime,
+		SELECT id, room_id, user_id, title, start_time, end_time, status
+		FROM bookings
+		WHERE room_id   = $1
+		AND status    = ANY($4)
+		AND start_time < $3
+		AND end_time   > $2
+		LIMIT 1`,
+		b.RoomID, b.StartTime, b.EndTime, activeStatuses,
 		).Scan(&c.ID, &c.RoomID, &c.UserID, &c.Title, &c.StartTime, &c.EndTime, &c.Status)
 		switch {
 		case scanErr == nil:
